@@ -114,25 +114,29 @@ Future<RobustFilePick> pickFilesRobust({
   final List<String>? nativeExtensions =
       (postFilter || !hasExtensions || plat.isWeb) ? null : allowedExtensions;
 
-  FilePickerResult? result;
+  List<PlatformFile> result = <PlatformFile>[];
   var usedCloudFallback = false;
-  try {
+
+  // file_picker 11+ returns List<PlatformFile> directly (FilePickerResult
+  // was removed); pickFile returns a single PlatformFile?.
+  Future<List<PlatformFile>> pickOnce() async {
     if (allowMultiple) {
-      result = await FilePicker.pickFiles(
+      return await FilePicker.pickFiles(
         type: effectiveType,
         allowedExtensions: nativeExtensions,
         dialogTitle: dialogTitle,
       );
-    } else {
-      final file = await FilePicker.pickFile(
-        type: effectiveType,
-        allowedExtensions: nativeExtensions,
-        dialogTitle: dialogTitle,
-      );
-      if (file != null) {
-        result = FilePickerResult([file]);
-      }
     }
+    final file = await FilePicker.pickFile(
+      type: effectiveType,
+      allowedExtensions: nativeExtensions,
+      dialogTitle: dialogTitle,
+    );
+    return file == null ? <PlatformFile>[] : [file];
+  }
+
+  try {
+    result = await pickOnce();
   } on PlatformException catch (e) {
     final isUnknownPath = (e.code.toLowerCase() == 'unknown_path') ||
         (e.message?.toLowerCase().contains('failed to retrieve path') ?? false);
@@ -141,22 +145,7 @@ Future<RobustFilePick> pickFilesRobust({
         'pick threw Unknown_path — retrying with stream fallback');
     try {
       // Re-pick; we'll read via readAsByteStream below when path is null.
-      if (allowMultiple) {
-        result = await FilePicker.pickFiles(
-          type: effectiveType,
-          allowedExtensions: nativeExtensions,
-          dialogTitle: dialogTitle,
-        );
-      } else {
-        final file = await FilePicker.pickFile(
-          type: effectiveType,
-          allowedExtensions: nativeExtensions,
-          dialogTitle: dialogTitle,
-        );
-        if (file != null) {
-          result = FilePickerResult([file]);
-        }
-      }
+      result = await pickOnce();
       usedCloudFallback = true;
     } catch (e2, st2) {
       Log.instance.e('file-picker', 'stream fallback pick also failed',
@@ -165,7 +154,7 @@ Future<RobustFilePick> pickFilesRobust({
     }
   }
 
-  if (result == null || result.files.isEmpty) {
+  if (result.isEmpty) {
     return RobustFilePick.empty;
   }
 
@@ -180,7 +169,7 @@ Future<RobustFilePick> pickFilesRobust({
   if (plat.isWeb) {
     final bytes = <Uint8List>[];
     final names = <String>[];
-    for (final f in result.files) {
+    for (final f in result) {
       if (extensionSet != null) {
         final ext = p.extension(f.name).toLowerCase().replaceFirst('.', '');
         if (!extensionSet.contains(ext)) continue;
@@ -199,7 +188,7 @@ Future<RobustFilePick> pickFilesRobust({
   // -- Native path: resolve to filesystem paths ---------------------------
   final localPaths = <String>[];
   final tmpDir = await getTemporaryDirectory();
-  for (final f in result.files) {
+  for (final f in result) {
     if (extensionSet != null) {
       final ext = p.extension(f.name).toLowerCase().replaceFirst('.', '');
       if (!extensionSet.contains(ext)) continue;

@@ -65,6 +65,14 @@ class SettingsScreen extends ConsumerStatefulWidget {
 }
 
 class _SettingsScreenState extends ConsumerState<SettingsScreen> {
+  final TextEditingController _mirrorAddController = TextEditingController();
+
+  @override
+  void dispose() {
+    _mirrorAddController.dispose();
+    super.dispose();
+  }
+
   @override
   Widget build(BuildContext context) {
     final settings = ref.watch(settingsServiceProvider);
@@ -799,6 +807,38 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
             ),
           );
         }),
+        // aria2 external downloader, used in **command-line** mode: it is
+        // spawned per download and fans out over its own 16 connections.
+        // Off = always the built-in Dart engine. Desktop-only: on mobile/web
+        // there is no aria2c to spawn, so the switch is hidden and downloads
+        // always use the built-in engine.
+        if (plat.isDesktop)
+          SwitchListTile(
+            title: Text(AppLocalizations.of(context).settingsUseAria2),
+            subtitle: Text(AppLocalizations.of(context).settingsUseAria2Desc),
+            value: settings.useAria2Downloads,
+            onChanged: (v) => setState(() => settings.useAria2Downloads = v),
+          ),
+        // Built-in (Dart) downloader segmentation: number of parallel
+        // connections for large-file downloads. 0 = single connection.
+        ListTile(
+          title: Text(AppLocalizations.of(context).settingsSegmentedDownload),
+          subtitle:
+              Text(AppLocalizations.of(context).settingsSegmentedDownloadDesc),
+          trailing: DropdownButton<int>(
+            value: settings.parallelDownloadConnections,
+            items: SettingsService.allowedParallelConnections
+                .map((v) => DropdownMenuItem<int>(
+                      value: v,
+                      child: Text(v == 0
+                          ? AppLocalizations.of(context).settingsSegmentedOff
+                          : v.toString()),
+                    ))
+                .toList(),
+            onChanged: (v) =>
+                setState(() => settings.parallelDownloadConnections = v ?? 4),
+          ),
+        ),
         ListTile(
           title: Text(AppLocalizations.of(context).settingsHfToken),
           subtitle: Text(settings.hfToken.isEmpty
@@ -807,6 +847,11 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
           trailing: const Icon(Icons.vpn_key),
           onTap: () => _showHfTokenDialog(settings),
         ),
+        // HuggingFace mirror hosts — tried top-down for API probes and by
+        // the built-in engine walking the list. (With aria2 enabled only the
+        // FIRST host is passed to aria2c: it downloads from one source, and
+        // on failure the built-in engine picks up the rest.)
+        ..._buildHfMirrorTiles(settings),
         // iOS sandboxes apps inside their container; pointing the model
         // store at an arbitrary folder requires security-scoped bookmarks
         // and a different storage flow. Hide the picker on iOS until that
@@ -1332,6 +1377,118 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(content: Text(l.settingsModelsDirSet(picked))),
     );
+  }
+
+  /// The HuggingFace mirror list: one ListTile per host with reorder and
+  /// delete affordances, plus an inline add row and a restore-defaults
+  /// action when the list differs from the built-in defaults. Writes go
+  /// straight into SettingsService — ModelService reads the list on
+  /// every download / probe, so no extra invalidation is needed.
+  ///
+  /// Order still matters, but differently from earlier builds: a **file
+  /// download binds to the top entry and stays there** (no mid-transfer
+  /// host switching — restarting gigabytes costs more than waiting), while
+  /// lightweight HF API probes keep walking the list top-down. With aria2
+  /// enabled the top entry is also the single source the external tool gets.
+  List<Widget> _buildHfMirrorTiles(SettingsService settings) {
+    final l = AppLocalizations.of(context);
+    final mirrors = settings.hfMirrors;
+    Widget reorderButton(int index, bool up) {
+      return IconButton(
+        visualDensity: VisualDensity.compact,
+        icon: Icon(up ? Icons.arrow_upward : Icons.arrow_downward, size: 20),
+        tooltip: up ? l.settingsHfMirrorMoveUp : l.settingsHfMirrorMoveDown,
+        onPressed: () {
+          final other = up ? index - 1 : index + 1;
+          final list = List.of(mirrors);
+          final tmp = list[other];
+          list[other] = list[index];
+          list[index] = tmp;
+          setState(() => settings.hfMirrors = list);
+        },
+      );
+    }
+
+    return [
+      ListTile(
+        title: Text(l.settingsHfMirrors),
+        subtitle: Text(l.settingsHfMirrorsSubtitle),
+        trailing: const Icon(Icons.language),
+      ),
+      for (var i = 0; i < mirrors.length; i++)
+        ListTile(
+          leading: Text('${i + 1}.',
+              style: const TextStyle(fontWeight: FontWeight.w500)),
+          title: Text(mirrors[i], style: const TextStyle(fontSize: 13)),
+          dense: true,
+          trailing: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              if (i > 0) reorderButton(i, true),
+              if (i < mirrors.length - 1) reorderButton(i, false),
+              IconButton(
+                visualDensity: VisualDensity.compact,
+                icon: const Icon(Icons.delete_outline, size: 20),
+                tooltip: l.settingsHfMirrorDelete,
+                onPressed: () {
+                  final list = List.of(mirrors)..removeAt(i);
+                  setState(() => settings.hfMirrors = list);
+                },
+              ),
+            ],
+          ),
+        ),
+      Padding(
+        padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
+        child: Row(
+          children: [
+            Expanded(
+              child: TextField(
+                controller: _mirrorAddController,
+                decoration: InputDecoration(
+                  labelText: l.settingsHfMirrorAdd,
+                  hintText: 'https://hf-mirror.com',
+                  border: const OutlineInputBorder(),
+                  isDense: true,
+                ),
+                style: const TextStyle(fontSize: 13),
+                autocorrect: false,
+              ),
+            ),
+            IconButton(
+              icon: const Icon(Icons.add_circle_outline),
+              tooltip: l.settingsHfMirrorAdd,
+              onPressed: () {
+                final url = _mirrorAddController.text.trim();
+                if (!url.startsWith('http://') &&
+                    !url.startsWith('https://')) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(content: Text(l.settingsHfMirrorInvalid)));
+                  return;
+                }
+                if (settings.hfMirrors.contains(url)) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(content: Text(l.settingsHfMirrorDuplicate)));
+                  return;
+                }
+                setState(() {
+                  settings.hfMirrors = [...settings.hfMirrors, url];
+                  _mirrorAddController.clear();
+                });
+              },
+            ),
+          ],
+        ),
+      ),
+      if (settings.hfMirrorsAreCustom)
+        Align(
+          alignment: Alignment.centerLeft,
+          child: TextButton(
+            onPressed: () => setState(() => settings.resetHfMirrors()),
+            child: Text(l.settingsHfMirrorsRestore),
+          ),
+        ),
+    ];
   }
 
   void _showHfTokenDialog(SettingsService settings) {

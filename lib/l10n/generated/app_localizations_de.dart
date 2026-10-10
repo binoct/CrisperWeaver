@@ -252,6 +252,51 @@ class AppLocalizationsDe extends AppLocalizations {
       'Nicht gesetzt (erforderlich für gated-Modelle)';
 
   @override
+  String get settingsHfMirrors => 'HuggingFace-Spiegel';
+
+  @override
+  String get settingsHfMirrorsSubtitle =>
+      'Modell-Downloads nutzen nur den obersten Eintrag; HF-API-Abfragen probieren die Liste weiterhin von oben nach unten. Den schnellsten Host nach oben sortieren.';
+
+  @override
+  String get settingsHfMirrorAdd => 'Spiegel hinzufügen';
+
+  @override
+  String get settingsUseAria2 => 'Aria2 für Modell-Downloads verwenden';
+
+  @override
+  String get settingsUseAria2Desc =>
+      'Wenn aria2c auf dem System verfügbar ist, lädt der Downloader mit 16 parallelen Verbindungen aus einer einzigen Quelle; bei Fehler übernimmt der eingebaute Downloader.';
+
+  @override
+  String get settingsSegmentedDownload => 'Segmentierter Download (integriert)';
+
+  @override
+  String get settingsSegmentedDownloadDesc =>
+      'Mehrfachverbindungen für den eingebauten Downloader. Aus = einzelne Verbindung.';
+
+  @override
+  String get settingsSegmentedOff => 'Aus (eine Verbindung)';
+
+  @override
+  String get settingsHfMirrorInvalid => 'Bitte eine http(s)://-URL eingeben';
+
+  @override
+  String get settingsHfMirrorDuplicate => 'Bereits in der Liste';
+
+  @override
+  String get settingsHfMirrorsRestore => 'Standardwerte wiederherstellen';
+
+  @override
+  String get settingsHfMirrorMoveUp => 'Nach oben';
+
+  @override
+  String get settingsHfMirrorMoveDown => 'Nach unten';
+
+  @override
+  String get settingsHfMirrorDelete => 'Entfernen';
+
+  @override
   String get settingsModelsDir => 'Modellverzeichnis';
 
   @override

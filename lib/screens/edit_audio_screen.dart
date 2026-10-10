@@ -314,7 +314,7 @@ class _EditAudioScreenState extends ConsumerState<EditAudioScreen> {
       allowedExtensions: const ['wav'],
       bytes: Uint8List(0),
     );
-    return path;
+    return path?.toFilePath();
   }
 
   void _toast(String msg) {

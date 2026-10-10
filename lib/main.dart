@@ -63,6 +63,7 @@ import 'services/speaker_id_service.dart';
 import 'services/transcription_service.dart';
 import 'services/baked_catalog_loader.dart';
 import 'services/model_service.dart';
+import 'services/model_residency.dart';
 import 'services/hotkey_service.dart';
 import 'services/preset_service.dart';
 import 'services/settings_service.dart';
@@ -200,6 +201,18 @@ Future<void> _bootstrap() async {
   final prefs = await SharedPreferences.getInstance();
   final settingsService = SettingsService(prefs);
   await _restoreModelsDirectoryAccess(settingsService);
+
+  // Seed the VRAM budget for the model-residency coordinator. Auto-probe
+  // the adapter on Windows (needs ~85% of total VRAM); a non-zero manual
+  // setting overrides the probe. Must run before any model load path calls
+  // reconcile(), which decides whether to free the previous task's model.
+  await ModelResidency.instance.probeTotalVram();
+  if (settingsService.gpuVramBudgetMb > 0) {
+    ModelResidency.instance.gpuBudgetBytes =
+        settingsService.gpuVramBudgetMb * 1024 * 1024;
+    Log.instance.i('main', 'VRAM budget overridden from settings',
+        fields: {'mb': settingsService.gpuVramBudgetMb});
+  }
 
   // Honour persisted user choice for log level. If unset, Log's default
   // (trace in debug, info in release) holds.
@@ -977,11 +990,14 @@ final transcriptionServiceProvider = Provider<TranscriptionService>((ref) {
   final audioService = ref.watch(audioServiceProvider);
   final modelService = ref.watch(modelServiceProvider);
   final speakerIdService = ref.watch(speakerIdServiceProvider);
-  return TranscriptionService(
+  final svc = TranscriptionService(
     audioService,
     modelService,
     speakerIdService: speakerIdService,
   );
+  ModelResidency.instance.register(ModelSlot.transcribe, svc.unloadModel,
+      footprint: () => svc.residentVramBytes);
+  return svc;
 });
 
 /// Path to the audio file the user has selected or just recorded — used to

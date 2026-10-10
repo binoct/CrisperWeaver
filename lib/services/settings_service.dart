@@ -163,12 +163,107 @@ class SettingsService {
     _prefs.setBool('ignore_memory_preflight', value);
   }
 
+  /// Use the external aria2c binary for model downloads (16 parallel
+  /// connections **against a single source** — Settings' top HF mirror or
+  /// the origin) when it is available. On by default; when off, downloads
+  /// always use the built-in Dart engine. On failure the built-in engine
+  /// takes over and retries that same source — nothing walks the mirror
+  /// list during a download, see [ModelService._downloadWithResume].
+  bool get useAria2Downloads => _prefs.getBool('use_aria2_downloads') ?? true;
+  set useAria2Downloads(bool value) =>
+      _prefs.setBool('use_aria2_downloads', value);
+
+  /// Manual GPU VRAM budget (MiB) for the model-residency coordinator.
+  ///
+  /// The coordinator ([ModelResidency]) frees other tasks' resident models
+  /// only when free VRAM is insufficient for the model about to load — see
+  /// the "unload previous model before loading the next" fix. With a value
+  /// of 0 (the default) it auto-probes the adapter's total VRAM on Windows
+  /// and uses ~85% of it; a positive value overrides that probe. Useful
+  /// when the probe reads the wrong figure (e.g. an iGPU / shared-memory
+  /// adapter reporting its stolen-RAM reservation) or the user knows their
+  /// real headroom. Persisted as int MiB.
+  int get gpuVramBudgetMb => _prefs.getInt('gpu_vram_budget_mb') ?? 0;
+  set gpuVramBudgetMb(int value) => _prefs.setInt('gpu_vram_budget_mb', value);
+
+  /// Built-in (Dart) downloader segmentation: how many parallel connections
+  /// the multi-connection engine uses for large files. 0 (or 1) disables
+  /// segmentation and falls back to a single sequential connection. Allowed
+  /// values: 0, 2, 4, 8. Default 4. Persisted as an int; anything else
+  /// falls back to 4.
+  static const List<int> allowedParallelConnections = [0, 2, 4, 8];
+  int get parallelDownloadConnections {
+    final raw = _prefs.getInt('parallel_download_connections');
+    if (raw == null) return 4;
+    return allowedParallelConnections.contains(raw) ? raw : 4;
+  }
+
+  set parallelDownloadConnections(int value) =>
+      _prefs.setInt('parallel_download_connections', value);
+
   String get hfToken => _prefs.getString('hf_token') ?? '';
   set hfToken(String token) {
     Log.instance
         .d('settings', 'Saving hfToken: ${token.isNotEmpty ? "SET" : "EMPTY"}');
     _prefs.setString('hf_token', token);
   }
+
+  /// Ordered HuggingFace hosts tried for model downloads and API probes.
+  /// The first host that answers wins; the rest are fallbacks tried in
+  /// order when a transfer or probe fails (connection error, timeout,
+  /// 5xx, 404). Persisted as a JSON string list; empty/unset means the
+  /// built-in defaults. Users can add (e.g. https://hf-mirror.com),
+  /// remove and reorder from Settings.
+  static const List<String> defaultHfMirrors = [
+    'https://hf-mirror.com',
+    'https://hf-mirror.net',
+    'https://huggingface.co',
+  ];
+
+  List<String> get hfMirrors {
+    final raw = _prefs.getString('hf_mirrors');
+    if (raw == null || raw.isEmpty) return List.of(defaultHfMirrors);
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is! List) return List.of(defaultHfMirrors);
+      final list = decoded
+          .whereType<String>()
+          .map((s) => s.trim())
+          .where((s) => s.startsWith('http://') || s.startsWith('https://'))
+          .toList();
+      if (list.isEmpty) return List.of(defaultHfMirrors);
+      // Order-preserving dedup: mirrors are tried sequentially, one at a
+      // time, so a duplicate would just waste a retry round on the same
+      // host.
+      final seen = <String>{};
+      return list
+          .where((s) => seen.add(s.endsWith('/')
+              ? s.substring(0, s.length - 1)
+              : s))
+          .toList();
+    } catch (e) {
+      Log.instance
+          .w('settings', 'hfMirrors decode failed — using defaults', error: e);
+      return List.of(defaultHfMirrors);
+    }
+  }
+
+  set hfMirrors(List<String> mirrors) {
+    _prefs.setString('hf_mirrors', jsonEncode(mirrors));
+  }
+
+  /// True when the persisted list differs from [defaultHfMirrors] —
+  /// drives the "restore defaults" affordance in Settings.
+  bool get hfMirrorsAreCustom {
+    final current = hfMirrors;
+    if (current.length != defaultHfMirrors.length) return true;
+    for (var i = 0; i < current.length; i++) {
+      if (current[i] != defaultHfMirrors[i]) return true;
+    }
+    return false;
+  }
+
+  void resetHfMirrors() => _prefs.remove('hf_mirrors');
 
   /// User-added HuggingFace repos for the "Add from HuggingFace repo"
   /// direct-download flow. Persisted as a JSON list of

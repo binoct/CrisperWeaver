@@ -28,6 +28,8 @@ import '../services/audio_prefetch_service.dart';
 import '../services/audio_service.dart';
 import '../services/batch_persistence_service.dart';
 import '../services/batch_queue_service.dart';
+// (DownloadProgressRing removed: transcription's active download now shows
+// a live text percentage; the ring was redundant.)
 import '../services/log_service.dart';
 import '../services/memory_estimator.dart';
 import '../services/preset_service.dart';
@@ -228,9 +230,18 @@ class _TranscriptionScreenState extends ConsumerState<TranscriptionScreen> {
     }
   }
 
+  // Active model downloads, mirrored from ModelService.activeDownloads so the
+  // card keeps showing progress even after navigating away and back.
+  List<ModelDownloadTask> _activeTasks = const [];
+  late final ModelService _modelSvc;
+
   @override
   void initState() {
     super.initState();
+    _modelSvc = ref.read(modelServiceProvider);
+    _activeTasks = _modelSvc.activeDownloads.value;
+    _modelSvc.activeDownloads.addListener(_onDownloadChanged);
+    _modelSvc.downloadGeneration.addListener(_onDownloadGeneration);
 
     // Initialize state from settings. Deferred to after the frame:
     // writing a provider from initState while the page mounts inside a
@@ -299,8 +310,23 @@ class _TranscriptionScreenState extends ConsumerState<TranscriptionScreen> {
     );
   }
 
+  void _onDownloadChanged() {
+    if (!mounted) return;
+    setState(() => _activeTasks = _modelSvc.activeDownloads.value);
+  }
+
+  void _onDownloadGeneration() {
+    // A download finished elsewhere: refresh the local model info so the
+    // card flips to "downloaded" without leaving this screen.
+    if (!mounted) return;
+    setState(() => _activeTasks = _modelSvc.activeDownloads.value);
+    _loadModels();
+  }
+
   @override
   void dispose() {
+    _modelSvc.activeDownloads.removeListener(_onDownloadChanged);
+    _modelSvc.downloadGeneration.removeListener(_onDownloadGeneration);
     _urlController.dispose();
     _modelFilterController.dispose();
     super.dispose();
@@ -535,26 +561,39 @@ class _TranscriptionScreenState extends ConsumerState<TranscriptionScreen> {
     }
   }
 
+  // Active model download card state is service-owned (ModelService
+  // .activeDownloads); the initState listeners mirror it here, so progress
+  // survives navigating away and back.
+
   Future<void> _downloadModel(ModelInfo model) async {
     final modelService = ref.read(modelServiceProvider);
+    final messenger = ScaffoldMessenger.of(context);
     try {
-      ScaffoldMessenger.of(context).showSnackBar(
+      messenger.showSnackBar(
         SnackBar(
-            content: Text(AppLocalizations.of(context)
-                .transcribeStarting(model.displayName))),
+          content: Text(AppLocalizations.of(context)
+              .transcribeStarting(model.displayName)),
+          // Downloads from this card used to be unstoppable, so keep a Stop
+          // action on screen for the whole transfer instead of a short-lived
+          // toast that disappears while gigabytes are still moving.
+          duration: const Duration(hours: 1),
+          action: SnackBarAction(
+            label: AppLocalizations.of(context).stop,
+            onPressed: () => modelService.cancelDownload(model.name),
+          ),
+        ),
       );
 
+      // Progress/status go through the service-level ModelDownloadTask —
+      // the initState listeners mirror them into _activeTasks for the card.
       final success = plat.isWeb
           ? await ref.read(transcriptionServiceProvider).loadModel(model.name)
-          : await modelService.downloadWhisperCppModel(
-              model.name,
-              onProgress: (p) {
-                // Optional: update UI with progress
-              },
-            );
+          : await modelService.downloadWhisperCppModel(model.name);
 
-      if (success && mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
+      if (!mounted) return;
+      messenger.hideCurrentSnackBar();
+      if (success) {
+        messenger.showSnackBar(
           SnackBar(
               content: Text(AppLocalizations.of(context)
                   .modelsDownloadedOne(model.displayName))),
@@ -562,10 +601,12 @@ class _TranscriptionScreenState extends ConsumerState<TranscriptionScreen> {
         _loadModels(); // Refresh list
       }
     } catch (e) {
-      if (mounted) {
-        _showErrorDialog(AppLocalizations.of(context)
-            .modelsDownloadFailedReason(e.toString()));
-      }
+      if (!mounted) return;
+      messenger.hideCurrentSnackBar();
+      // The user asked to stop; that is not a failure worth an error dialog.
+      if (e.toString().toLowerCase().contains('cancel')) return;
+      _showErrorDialog(AppLocalizations.of(context)
+          .modelsDownloadFailedReason(e.toString()));
     }
   }
 
@@ -1420,6 +1461,13 @@ class _TranscriptionScreenState extends ConsumerState<TranscriptionScreen> {
                         return _buildRecommendedBanner(recommended);
                       }
                       final model = filtered[index - bannerCount];
+                      ModelDownloadTask? dl;
+                      for (final t in _activeTasks) {
+                        if (t.modelName == model.name) {
+                          dl = t;
+                          break;
+                        }
+                      }
                       final isSelected = _modelName == model.name;
                       return ListTile(
                         dense: true,
@@ -1444,8 +1492,13 @@ class _TranscriptionScreenState extends ConsumerState<TranscriptionScreen> {
                             ],
                           ],
                         ),
-                        subtitle: Text(
-                            '${model.size} • ${model.backend} • ${model.quantization.isEmpty ? "f16" : model.quantization}'),
+                        subtitle: (dl != null && dl.status.isNotEmpty)
+                            ? Text(dl.status,
+                                style: TextStyle(
+                                    fontSize: 12,
+                                    color: Colors.blue.shade700))
+                            : Text(
+                                '${model.size} • ${model.backend} • ${model.quantization.isEmpty ? "f16" : model.quantization}'),
                         trailing: _buildModelAction(model),
                         onTap: () => _selectModelWithDownloadPrompt(model),
                       );
@@ -1484,6 +1537,26 @@ class _TranscriptionScreenState extends ConsumerState<TranscriptionScreen> {
       return _modelName == model.name
           ? const Icon(Icons.check_circle, color: Colors.green)
           : const Icon(Icons.check, color: Colors.grey);
+    }
+    // Active download: show the live percentage as text. The redundant
+    // ring was removed; speed still rides along in the card subtitle via
+    // the service-owned task.
+    ModelDownloadTask? dl;
+    for (final t in _activeTasks) {
+      if (t.modelName == model.name) {
+        dl = t;
+        break;
+      }
+    }
+    if (dl != null) {
+      return Text(
+        '${((dl.progress) * 100).round()}%',
+        style: TextStyle(
+          fontSize: 12,
+          fontWeight: FontWeight.w600,
+          color: Theme.of(context).colorScheme.primary,
+        ),
+      );
     }
     return IconButton(
       icon: const Icon(Icons.download, size: 20),

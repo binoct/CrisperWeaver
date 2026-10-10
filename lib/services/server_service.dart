@@ -21,6 +21,7 @@ import 'log_service.dart';
 import 'punc_service.dart';
 import 'text_translation_service.dart';
 import 'transcription_service.dart';
+import 'model_residency.dart';
 import 'tts_service.dart';
 import 'vad_service.dart';
 import '../native/crispasr_import.dart' as crispasr;
@@ -72,6 +73,12 @@ class ServerService {
       Log.instance.w('server', 'start() called while already running');
       return _boundUrl!;
     }
+    // The server drives several models across requests (TTS + translation
+    // + transcription). The residency coordinator would otherwise unload a
+    // model another endpoint just loaded, thrashing VRAM across calls. The
+    // server is the single owner of model lifetime while it runs, so
+    // disable coordination for its lifetime (re-enabled in stop()).
+    ModelResidency.instance.enabled = false;
     final router = _buildRouter();
     final handler = const Pipeline()
         .addMiddleware(_logRequests())
@@ -124,6 +131,8 @@ class ServerService {
     await s.close(force: true);
     _server = null;
     _boundUrl = null;
+    // Hand model-lifetime coordination back to the UI coordinator.
+    ModelResidency.instance.enabled = true;
     Log.instance.i('server', 'stopped');
   }
 

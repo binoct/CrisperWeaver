@@ -714,7 +714,13 @@ class _SynthesizeScreenState extends ConsumerState<SynthesizeScreen> {
     final messenger = ScaffoldMessenger.of(context);
     messenger.showSnackBar(SnackBar(
       content: Text(l10n.synthDownloadingNamed(info.displayName)),
-      duration: const Duration(seconds: 30),
+      // Stay up for the whole transfer rather than 30 s, and offer Stop —
+      // a multi-hundred-MB voice download previously could not be aborted.
+      duration: const Duration(hours: 1),
+      action: SnackBarAction(
+        label: l10n.stop,
+        onPressed: () => svc.cancelDownload(info.name),
+      ),
     ));
     try {
       final ok = await svc.downloadWhisperCppModel(info.name);
@@ -731,9 +737,12 @@ class _SynthesizeScreenState extends ConsumerState<SynthesizeScreen> {
           error: e, stack: st, fields: {'name': info.name});
       if (mounted) {
         messenger.hideCurrentSnackBar();
+        // The user pressed Stop; report exactly that, not a failure.
+        final stopped = e.toString().toLowerCase().contains('cancel');
         messenger.showSnackBar(SnackBar(
-          content: Text(
-              l10n.synthDownloadFailedNamed(info.displayName, e.toString())),
+          content: Text(stopped
+              ? l10n.stop
+              : l10n.synthDownloadFailedNamed(info.displayName, e.toString())),
         ));
       }
     }

@@ -13,6 +13,7 @@ import '../../utils/ai_text_disclosure.dart';
 import '../audio_service.dart';
 import '../log_service.dart';
 import '../model_catalog.dart';
+import '../model_residency.dart';
 import '../model_service.dart';
 import '../settings_service.dart';
 import '../system_audio_capture_service.dart';
@@ -459,6 +460,7 @@ class LiveTranslateController extends Notifier<LiveTranslateState> {
         _spawnAsr(paths),
         if (paths.translatorPath != null) _spawnTranslator(paths),
       ]);
+      await _reserveIsolateVram(paths);
       await _startAudio(replayFile);
       state = state.copyWith(status: LiveStatus.running);
       Log.instance.i('live', 'started', fields: {
@@ -597,6 +599,8 @@ class LiveTranslateController extends Notifier<LiveTranslateState> {
     _asrIso = _trIso = null;
     _asrPort = _trPort = null;
     _asrEvents = _trEvents = null;
+    // Both isolates are gone, so their VRAM is back in the pool.
+    ModelResidency.instance.clearExternal('live');
   }
 
   /// `onExit` delivers null, `onError` a [message, stack] list. Either one
@@ -609,6 +613,36 @@ class LiveTranslateController extends Notifier<LiveTranslateState> {
           : 'The $what stopped while loading.'));
     }
     return true;
+  }
+
+  /// The recogniser and translator run in their own isolates and open the
+  /// native session directly, so [ModelResidency] can neither see nor
+  /// release them. Declare how much VRAM they hold so the coordinator does
+  /// not treat that memory as free when another task loads a model on the
+  /// main thread. Bookkeeping only — these models are never unloaded from
+  /// here, which is what keeps a live session's own models safe.
+  Future<void> _reserveIsolateVram(LiveModelPaths paths) async {
+    try {
+      var bytes = 0;
+      for (final f in <String?>[
+        paths.asrPath,
+        paths.translatorPath,
+        paths.vadPath,
+        paths.audioLidPath,
+        paths.textLidPath,
+      ]) {
+        if (f == null) continue;
+        try {
+          bytes += await File(f).length();
+        } catch (_) {
+          // Missing or unreadable file: simply not counted.
+        }
+      }
+      ModelResidency.instance.setExternal('live', bytes);
+      Log.instance.d('live', 'reserved isolate VRAM', fields: {'bytes': bytes});
+    } catch (e) {
+      Log.instance.d('live', 'isolate VRAM reserve failed: $e');
+    }
   }
 
   Future<void> _spawnAsr(LiveModelPaths paths) async {

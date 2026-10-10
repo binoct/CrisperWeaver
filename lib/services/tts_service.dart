@@ -14,6 +14,7 @@ import '../utils/marked_wav.dart';
 import 'audio_watermark_service.dart';
 import 'content_provenance_service.dart';
 import 'log_service.dart';
+import 'model_residency.dart';
 import 'spread_spectrum_watermark.dart';
 import 'model_service.dart';
 
@@ -135,6 +136,9 @@ class TtsService {
   String? _modelPath;
   String? _voicePath;
   String? _codecPath;
+  // VRAM footprint (bytes) of the currently loaded model, reported to
+  // [ModelResidency] so task switches can decide whether to keep it.
+  int _loadedBytes = 0;
   String? _prepSpeakerName;
   int? _prepSpeakerId;
   String? _prepInstructPrompt;
@@ -256,6 +260,17 @@ class TtsService {
     if (_session != null && _key == key) {
       return TtsLoadStatus.ready(_backend!);
     }
+
+    // Footprint for VRAM-aware coordination: sum EVERY file this task
+    // currently holds on the GPU (main model + voice + codec) — some TTS
+    // backends must keep two models resident at once, and they all live in
+    // THIS slot, so reconcile never unloads them. Summing keeps the
+    // cross-task "is there room?" decision accurate.
+    var bytes = await File(modelPath).length();
+    if (voicePath != null) bytes += await File(voicePath).length();
+    if (codecPath != null) bytes += await File(codecPath).length();
+    _loadedBytes = bytes;
+    await ModelResidency.instance.reconcile(ModelSlot.tts, _loadedBytes);
 
     // Reopen.
     _session?.close();
@@ -1049,6 +1064,22 @@ class TtsService {
         'attestation="user consent"');
   }
 
+  /// Release the resident GPU model without tearing the service down, so
+  /// another task (e.g. translation) can take the GPU slot. The next
+  /// [loadModel] / synthesize reopens it. Distinct from [dispose], which is
+  /// only called when the provider is destroyed.
+  Future<void> unload() async {
+    _session?.close();
+    _session = null;
+    _key = null;
+    _backend = null;
+    _outputSampleRate = kFallbackOutputSampleRate;
+    _modelPath = null;
+    _voicePath = null;
+    _codecPath = null;
+    _loadedBytes = 0;
+  }
+
   void dispose() {
     _session?.close();
     _session = null;
@@ -1154,5 +1185,7 @@ class TtsLoadStatus {
 final ttsServiceProvider = Provider<TtsService>((ref) {
   final svc = TtsService(ref.watch(modelServiceProvider));
   ref.onDispose(svc.dispose);
+  ModelResidency.instance.register(ModelSlot.tts, svc.unload,
+      footprint: () => svc._loadedBytes);
   return svc;
 });

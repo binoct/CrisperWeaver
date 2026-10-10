@@ -10,6 +10,8 @@ import '../services/memory_estimator.dart' show memoryEstimatorProvider;
 import '../services/model_service.dart';
 import '../services/starter_models.dart';
 import '../services/settings_service.dart' show settingsServiceProvider;
+// (DownloadProgressRing removed: download progress is now shown as a text
+// percentage + status + a linear bar, so the ring was redundant.)
 import '../widgets/root_aware_back_leading.dart';
 
 class ModelManagementScreen extends ConsumerStatefulWidget {
@@ -43,8 +45,12 @@ class _ModelManagementScreenState extends ConsumerState<ModelManagementScreen> {
   // rather than shown under every language (issue #35).
   String _languageFilter = '';
   bool _isLoading = true;
-  String? _downloadingModel;
-  double _downloadProgress = 0.0;
+  // Live download state is owned by ModelService (navigation-proof) and
+  // mirrored here via the listeners wired in initState — navigating away
+  // and back re-attaches to the in-flight download instead of losing it.
+  List<ModelDownloadTask> _activeTasks = const [];
+  int _downloadGeneration = -1;
+  late final ModelService _modelSvc;
   // null = "All". Otherwise filter to entries whose `kind` matches.
   ModelKind? _kindFilter;
   // Secondary filter active when _kindFilter == ModelKind.voice. Empty
@@ -62,22 +68,54 @@ class _ModelManagementScreenState extends ConsumerState<ModelManagementScreen> {
     // `initialKindFilter:`).
     final advanced = ref.read(settingsServiceProvider).experimentalFeatures;
     _kindFilter = widget.initialKindFilter ?? (advanced ? null : ModelKind.asr);
+    // Attach to the service-owned download state BEFORE the first
+    // _loadModels(): navigating back into this screen re-attaches to an
+    // in-flight download instead of losing its progress.
+    _modelSvc = ref.read(modelServiceProvider);
+    _activeTasks = _modelSvc.activeDownloads.value;
+    _downloadGeneration = _modelSvc.downloadGeneration.value;
+    _modelSvc.activeDownloads.addListener(_onDownloadChanged);
+    _modelSvc.downloadGeneration.addListener(_onDownloadGeneration);
     _loadModels();
     // Auto-probe HuggingFace the first time the screen opens so users see
     // every available quant for every backend without having to know the
     // cloud-download button exists. Subsequent visits reuse the cached
     // results (no re-probe unless the user taps the button explicitly).
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      final svc = ref.read(modelServiceProvider);
       if (ref.read(settingsServiceProvider).experimentalFeatures &&
-          !svc.hasProbedQuants) {
+          !_modelSvc.hasProbedQuants) {
         _probeHf();
       }
     });
   }
 
+  void _onDownloadChanged() {
+    if (!mounted) return;
+    setState(() => _activeTasks = _modelSvc.activeDownloads.value);
+  }
+
+  void _onDownloadGeneration() {
+    // A download finished (success or failure): auto-refresh the local
+    // model info so isDownloaded flips without a manual reload.
+    if (!mounted) return;
+    setState(() => _activeTasks = _modelSvc.activeDownloads.value);
+    _loadModels();
+  }
+
+  /// Find the in-flight download task for [modelName], or null. This lets
+  /// every model card render its own progress instead of a single shared
+  /// slot that flips between models when several download at once.
+  ModelDownloadTask? _activeTaskFor(String modelName) {
+    for (final t in _activeTasks) {
+      if (t.modelName == modelName) return t;
+    }
+    return null;
+  }
+
   @override
   void dispose() {
+    _modelSvc.activeDownloads.removeListener(_onDownloadChanged);
+    _modelSvc.downloadGeneration.removeListener(_onDownloadGeneration);
     _nameFilterController.dispose();
     super.dispose();
   }
@@ -366,7 +404,7 @@ class _ModelManagementScreenState extends ConsumerState<ModelManagementScreen> {
             icon: const Icon(Icons.rocket_launch_outlined),
             tooltip: AppLocalizations.of(context).modelsQuickStartTooltip,
             onPressed:
-                (_downloadingModel != null) ? null : _showQuickStartSheet,
+                (_activeTasks.isNotEmpty) ? null : _showQuickStartSheet,
           ),
           if (advanced) ...[
             IconButton(
@@ -441,6 +479,20 @@ class _ModelManagementScreenState extends ConsumerState<ModelManagementScreen> {
         return hay.contains(_nameFilter);
       }).toList();
     }
+
+    // Priority ordering: the in-flight download first (its progress is what
+    // the user came to watch), then downloaded models, then the rest.
+    int rank(ModelInfo m) {
+      if (_activeTasks.any((t) => t.modelName == m.name)) return 0;
+      if (m.isDownloaded) return 1;
+      return 2;
+    }
+
+    filtered.sort((a, b) {
+      final r = rank(a).compareTo(rank(b));
+      if (r != 0) return r;
+      return a.displayName.toLowerCase().compareTo(b.displayName.toLowerCase());
+    });
 
     return Column(
       children: [
@@ -760,7 +812,8 @@ class _ModelManagementScreenState extends ConsumerState<ModelManagementScreen> {
   }
 
   Widget _buildModelCard(ModelInfo model) {
-    final isDownloading = _downloadingModel == model.name;
+    final task = _activeTaskFor(model.name);
+    final isDownloading = task != null;
     final fit = StarterModels.fitFor(
         model.sizeBytes, ref.read(memoryEstimatorProvider));
 
@@ -868,11 +921,19 @@ class _ModelManagementScreenState extends ConsumerState<ModelManagementScreen> {
                   children: [
                     Text(
                       AppLocalizations.of(context).modelsDownloadingPercent(
-                          (_downloadProgress * 100).toStringAsFixed(1)),
+                          ((task?.progress ?? 0) * 100).toStringAsFixed(1)),
                       style: TextStyle(color: Colors.blue.shade700),
                     ),
+                    if ((task?.status ?? '').isNotEmpty) ...[
+                      const SizedBox(height: 2),
+                      Text(
+                        task!.status,
+                        style: TextStyle(
+                            fontSize: 11, color: Colors.blueGrey.shade600),
+                      ),
+                    ],
                     const SizedBox(height: 4),
-                    LinearProgressIndicator(value: _downloadProgress),
+                    LinearProgressIndicator(value: task?.progress ?? 0),
                   ],
                 )
               else
@@ -888,7 +949,24 @@ class _ModelManagementScreenState extends ConsumerState<ModelManagementScreen> {
                   onPressed: () => _deleteModel(model),
                   tooltip: AppLocalizations.of(context).modelsDelete,
                 ),
-              ] else if (!isDownloading) ...[
+              ] else if (isDownloading) ...[
+                // Stopping an in-flight transfer. This slot used to be EMPTY
+                // while a download ran, which left no way to abort a
+                // multi-gigabyte fetch short of restarting the app — the only
+                // thing the row offered was a percentage creeping upwards.
+                if (MediaQuery.sizeOf(context).width < 600)
+                  IconButton(
+                    icon: const Icon(Icons.stop_circle_outlined),
+                    tooltip: AppLocalizations.of(context).stop,
+                    onPressed: () => _cancelDownload(model),
+                  )
+                else
+                  OutlinedButton.icon(
+                    icon: const Icon(Icons.stop_circle_outlined),
+                    label: Text(AppLocalizations.of(context).stop),
+                    onPressed: () => _cancelDownload(model),
+                  ),
+              ] else ...[
                 if (MediaQuery.sizeOf(context).width < 600)
                   IconButton.filledTonal(
                     icon: const Icon(Icons.download),
@@ -1146,6 +1224,26 @@ class _ModelManagementScreenState extends ConsumerState<ModelManagementScreen> {
     return ok ?? false;
   }
 
+  /// Stop an in-flight download; the row falls back to its idle state.
+  ///
+  /// The partial `.tmp` (and aria2's control file) is deliberately left on
+  /// disk so a later attempt resumes instead of refetching gigabytes.
+  Future<void> _cancelDownload(ModelInfo model) async {
+    try {
+      await ref.read(modelServiceProvider).cancelDownload(model.name);
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text(e.toString())));
+    }
+  }
+
+  /// True when [e] is the cancellation raised by the user rather than a real
+  /// transfer failure. Reported word "cancel" covers both the explicit
+  /// `ModelException('Download cancelled')` and dio's cancel type.
+  static bool _isCancelled(Object e) =>
+      e.toString().toLowerCase().contains('cancel');
+
   Future<void> _downloadModel(ModelInfo model) async {
     final l10n = AppLocalizations.of(context);
     final modelService = ref.read(modelServiceProvider);
@@ -1200,17 +1298,10 @@ class _ModelManagementScreenState extends ConsumerState<ModelManagementScreen> {
     try {
       for (final item in queue) {
         if (!mounted) return;
-        setState(() {
-          _downloadingModel = item.name;
-          _downloadProgress = 0.0;
-        });
-        final ok = await modelService.downloadWhisperCppModel(
-          item.name,
-          onProgress: (progress) {
-            if (!mounted) return;
-            setState(() => _downloadProgress = progress);
-          },
-        );
+        // Progress/status flow through ModelService.activeDownloads (the
+        // initState listeners mirror it into _activeTasks) — no local
+        // bookkeeping here.
+        final ok = await modelService.downloadWhisperCppModel(item.name);
         if (!ok) {
           _showErrorDialog(l10n.modelsDownloadFailedNamed(item.displayName));
           return;
@@ -1225,14 +1316,11 @@ class _ModelManagementScreenState extends ConsumerState<ModelManagementScreen> {
           .showSnackBar(SnackBar(content: Text(summary)));
       await _loadModels();
     } catch (e) {
+      // A user-initiated stop arrives here as a cancellation. Reporting it as
+      // "download failed" would make the Stop button look broken, so swallow
+      // it — the row has already fallen back to its idle state.
+      if (_isCancelled(e)) return;
       _showErrorDialog(l10n.modelsDownloadFailedReason(e.toString()));
-    } finally {
-      if (mounted) {
-        setState(() {
-          _downloadingModel = null;
-          _downloadProgress = 0.0;
-        });
-      }
     }
   }
 

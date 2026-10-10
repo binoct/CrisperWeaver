@@ -108,8 +108,8 @@ class _BrowserModelsScreenState extends ConsumerState<BrowserModelsScreen> {
       if (import) {
         final picked = await FilePicker.pickFiles(
             type: FileType.custom, allowedExtensions: ['bin', 'gguf']);
-        if (picked == null) return;
-        final bytes = await picked.files.single.readAsBytes();
+        if (picked.isEmpty) return;
+        final bytes = await picked.single.readAsBytes();
         await (service.currentEngine as BrowserSpeechEngine)
             .importModel(model.id, bytes);
       } else {

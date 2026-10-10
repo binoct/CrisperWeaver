@@ -251,6 +251,51 @@ class AppLocalizationsEn extends AppLocalizations {
   String get settingsHfTokenNotSet => 'Not set (required for gated models)';
 
   @override
+  String get settingsHfMirrors => 'HuggingFace mirrors';
+
+  @override
+  String get settingsHfMirrorsSubtitle =>
+      'Model downloads use only the top entry; HF API probes still try the list top-down. Put your fastest host first.';
+
+  @override
+  String get settingsHfMirrorAdd => 'Add mirror';
+
+  @override
+  String get settingsUseAria2 => 'Use Aria2 for model downloads';
+
+  @override
+  String get settingsUseAria2Desc =>
+      'When aria2c is available on the system, downloads use 16 parallel connections from a single source; on failure the built-in engine takes over.';
+
+  @override
+  String get settingsSegmentedDownload => 'Segmented download (built-in)';
+
+  @override
+  String get settingsSegmentedDownloadDesc =>
+      'Multi-connection download for the built-in engine. Off uses a single connection.';
+
+  @override
+  String get settingsSegmentedOff => 'Off (single connection)';
+
+  @override
+  String get settingsHfMirrorInvalid => 'Enter an http(s):// URL';
+
+  @override
+  String get settingsHfMirrorDuplicate => 'Already in the list';
+
+  @override
+  String get settingsHfMirrorsRestore => 'Restore defaults';
+
+  @override
+  String get settingsHfMirrorMoveUp => 'Move up';
+
+  @override
+  String get settingsHfMirrorMoveDown => 'Move down';
+
+  @override
+  String get settingsHfMirrorDelete => 'Remove';
+
+  @override
   String get settingsModelsDir => 'Models directory';
 
   @override

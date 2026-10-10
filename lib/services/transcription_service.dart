@@ -12,6 +12,7 @@ import '../engines/hfspace_engine.dart' show HfSpaceEngine;
 import '../engines/transcription_engine.dart';
 import 'audio_service.dart';
 import 'log_service.dart';
+import 'model_residency.dart';
 import 'model_service.dart';
 import 'diarization_service.dart';
 import 'punc_service.dart';
@@ -340,6 +341,13 @@ class TranscriptionService {
 
   bool _isTranscribing = false;
   StreamSubscription<TranscriptionSegment>? _streamSubscription;
+  // VRAM footprint (bytes) of the currently loaded transcription model,
+  // reported to [ModelResidency] so task switches can decide whether to
+  // keep it (switching to TTS / translation frees it when VRAM is tight).
+  int _transcribeLoadedBytes = 0;
+
+  /// Public footprint accessor for [ModelResidency] registration.
+  int get residentVramBytes => _transcribeLoadedBytes;
 
   /// The full result (including metadata) from the most recent successful
   /// transcription — populated after [transcribeFile] / [transcribeUrl]
@@ -826,8 +834,15 @@ class TranscriptionService {
           'Cannot load model while transcribing');
     }
 
+    // VRAM-aware coordination: free TTS / translation models only if there
+    // isn't room for this transcription model alongside them.
+    final footprint = _modelService.lookupDefinition(modelId)?.sizeBytes ?? 0;
+    await ModelResidency.instance.reconcile(ModelSlot.transcribe, footprint);
+
     try {
-      return await engine.loadModel(modelId, onProgress: onProgress);
+      final ok = await engine.loadModel(modelId, onProgress: onProgress);
+      if (ok) _transcribeLoadedBytes = footprint;
+      return ok;
     } catch (e) {
       throw TranscriptionServiceException('Failed to load model $modelId: $e');
     }

@@ -9,6 +9,7 @@ import 'package:path/path.dart' as p;
 import '../main.dart' show modelServiceProvider;
 import 'live_translate/live_translator_worker.dart';
 import 'log_service.dart';
+import 'model_residency.dart';
 import 'model_service.dart';
 
 /// Text-to-text translation via CrispASR's `crispasr_session_translate_text`
@@ -29,6 +30,9 @@ class TextTranslationService {
 
   // Cached session keyed by `<modelPath>` so the next call reuses it.
   String? _loadedPath;
+  // VRAM footprint (bytes) of the currently loaded model, reported to
+  // [ModelResidency] so task switches can decide whether to keep it.
+  int _loadedBytes = 0;
   crispasr.CrispasrSession? _session;
 
   /// Resolve a downloaded model path. Returns null when the file
@@ -67,8 +71,19 @@ class TextTranslationService {
     // Translation chat LLMs (Hy-MT2, Index-Translate) are not session
     // translators; they run in the live translator's worker isolate, which
     // also keeps a multi-second generation off the UI isolate.
-    if (modelService.lookupDefinition(modelName)?.backend ==
-        chatTranslateBackend) {
+    final isChat = modelService.lookupDefinition(modelName)?.backend ==
+        chatTranslateBackend;
+
+    // VRAM-aware coordination: free other tasks' resident models only if
+    // there isn't room for this one alongside them. The chat path and the
+    // session path share the translation slot family, so loading a chat
+    // model releases a stale session model and vice versa — but TTS /
+    // transcription models are only released when VRAM is actually tight.
+    _loadedBytes = await File(modelPath).length();
+    await ModelResidency.instance.reconcile(
+        isChat ? ModelSlot.chat : ModelSlot.translate, _loadedBytes);
+
+    if (isChat) {
       if (text.trim().isEmpty) return '';
       return _chatTranslate(modelPath, text, srcLang, tgtLang);
     }
@@ -210,6 +225,17 @@ class TextTranslationService {
     _chatPort = null;
     _chatEvents = null;
     _chatPath = null;
+  }
+
+  /// Release the resident GPU model(s) (both the main translation session
+  /// and the chat-translate worker) so another task can take the GPU slot.
+  /// Distinct from [dispose].
+  Future<void> unload() async {
+    _session?.close();
+    _session = null;
+    _loadedPath = null;
+    _loadedBytes = 0;
+    _closeChat();
   }
 
   void dispose() {

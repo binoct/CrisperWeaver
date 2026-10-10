@@ -1,9 +1,11 @@
 // lib/services/model_service.dart (COMPLETE IMPLEMENTATION)
+import 'dart:async';
 import 'dart:io';
 import 'dart:isolate';
 
 import 'package:archive/archive.dart' show ZipDecoder;
 import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart' show ValueNotifier;
 import 'package:path_provider/path_provider.dart';
 import 'package:path/path.dart' as path;
 import 'package:crypto/crypto.dart';
@@ -17,6 +19,7 @@ import '../native/disk_space_import.dart';
 import 'log_service.dart';
 import 'settings_service.dart';
 import 'security_scoped_bookmarks.dart';
+import 'aria2_process_binding.dart';
 import '../utils/platform_utils.dart' as plat;
 import 'model_catalog.dart';
 
@@ -27,6 +30,78 @@ class ModelService {
   late String _modelsDir;
   final SettingsService _settingsService;
   final Map<String, CancelToken> _activeDowloads = {};
+
+  /// Live download tasks, keyed by model name (a model can only download
+  /// once at a time). Owned by the service singleton (NOT a screen's local
+  /// State), so progress survives navigation: every screen renders the full
+  /// set and re-attaches to in-flight downloads after navigating away.
+  /// Kept newest-first by [ModelDownloadTask.startedAt] so any aggregate
+  /// view lists the most-recently-started download on top.
+  final ValueNotifier<List<ModelDownloadTask>> activeDownloads =
+      ValueNotifier<List<ModelDownloadTask>>(const []);
+
+  /// Bumped on every finished download (success OR failure). Screens listen
+  /// to auto-refresh their local model info (isDownloaded flags).
+  final ValueNotifier<int> downloadGeneration = ValueNotifier<int>(0);
+
+  /// Ordered HuggingFace hosts to try, straight from Settings.
+  List<String> get _hfMirrors => _settingsService.hfMirrors;
+
+  /// Rewrite an `https://huggingface.co/...` URL onto [mirror]. Any other
+  /// URL (custom catalogue endpoint, non-HF host) passes through
+  /// untouched, so catalogue entries that point elsewhere keep working.
+  static String _rewriteHfUrl(String url, String mirror) {
+    const origin = 'https://huggingface.co';
+    if (!url.startsWith(origin)) return url;
+    final trimmed =
+        mirror.endsWith('/') ? mirror.substring(0, mirror.length - 1) : mirror;
+    return '$trimmed${url.substring(origin.length)}';
+  }
+
+  /// [url] plus the same path on every configured mirror — the attempt
+  /// order for lightweight HF API probes ([_hfGet]). Mirrors are tried **in
+  /// the exact order the user set in Settings** (`hf_mirrors`); we no longer
+  /// force the origin ahead of the list, so reordering mirrors in Settings
+  /// actually changes which host is tried first. The origin is only appended
+  /// as a final fallback when no configured mirror already maps to it.
+  ///
+  /// **File downloads use [first] and nothing else** — see
+  /// [_downloadWithResume] for why: switching hosts mid-transfer restarts
+  /// gigabytes and buys nothing. The rest of the list still forms the user's
+  /// ranked preference, they just act on it in Settings rather than having
+  /// us churn through it during every download.
+  List<String> _hfAttemptUrls(String url) {
+    final mirrors = _hfMirrors;
+    final isHf = url.startsWith('https://huggingface.co');
+    if (!isHf) return [url]; // non-HF: pass through untouched.
+    if (mirrors.isEmpty) return [url]; // nothing configured: just origin.
+    final rewritten =
+        mirrors.map((m) => _rewriteHfUrl(url, m)).toList(growable: false);
+    // Origin fallback only when no mirror rewrote to the same URL.
+    if (!rewritten.any((u) => u == url)) return [...rewritten, url];
+    return rewritten;
+  }
+
+  /// GET an HF API endpoint, walking the mirror list on failure. User
+  /// cancellation propagates immediately; everything else (connection
+  /// error, timeout, 4xx, 5xx) advances to the next host.
+  Future<Response<T>> _hfGet<T>(String url, {Options? options}) async {
+    final attempts = _hfAttemptUrls(url);
+    Object? lastError;
+    for (var i = 0; i < attempts.length; i++) {
+      try {
+        return await _dio.get<T>(attempts[i], options: options);
+      } on DioException catch (e) {
+        if (e.type == DioExceptionType.cancel) rethrow;
+        lastError = e;
+        if (i < attempts.length - 1) {
+          Log.instance.w('model', 'HF request failed — trying next mirror',
+              fields: {'url': attempts[i], 'next': attempts[i + 1]});
+        }
+      }
+    }
+    throw lastError!;
+  }
 
   // Live-probed quants, keyed by model name (same as the hardcoded maps).
   // Merged with the static catalog in getWhisperCppModels().
@@ -108,6 +183,28 @@ class ModelService {
         Log.instance.w(
             'model', 'App Group resolve failed — falling back to docs dir',
             fields: {'path': appDir.path});
+      }
+    } else if (plat.isWindows || plat.isLinux) {
+      // Default the model library to the **program root** (next to the
+      // executable): a portable install then carries binaries + models on
+      // one drive, and moving the folder moves everything. A custom
+      // `customModelsDir` override still wins (see whisperCppDir()); if the
+      // executable path cannot be resolved we fall back to the documents
+      // directory. macOS deliberately keeps the documents dir — inside an
+      // .app bundle the path is unreliable (signature/App Translocation).
+      String? exeRoot;
+      try {
+        exeRoot = File(Platform.resolvedExecutable).parent.path;
+      } catch (_) {
+        exeRoot = null;
+      }
+      if (exeRoot != null && exeRoot.isNotEmpty) {
+        baseDirPath = exeRoot;
+        Log.instance.i('model', 'Using program root for models',
+            fields: {'path': exeRoot});
+      } else {
+        final appDir = await getApplicationDocumentsDirectory();
+        baseDirPath = appDir.path;
       }
     } else {
       final appDir = await getApplicationDocumentsDirectory();
@@ -329,7 +426,18 @@ class ModelService {
       ));
     }
 
-    return modelInfos;
+    // Downloaded-first ordering for every consumer (model pickers on the
+    // transcribe / synthesize / translate / music / live-translate screens
+    // all read this list): downloaded models float to the top so the one
+    // the user can actually run is right there. Stable within each group —
+    // the catalogue's curated order is preserved.
+    final indexed = modelInfos.asMap().entries.toList();
+    indexed.sort((a, b) {
+      final d = (b.value.isDownloaded ? 1 : 0) - (a.value.isDownloaded ? 1 : 0);
+      return d != 0 ? d : a.key.compareTo(b.key);
+    });
+
+    return indexed.map((e) => e.value).toList();
   }
 
   /// Unified lookup — finds a model by name across every catalog including
@@ -454,8 +562,7 @@ class ModelService {
       headers['Authorization'] = 'Bearer $token';
     }
     final url = 'https://huggingface.co/api/models/$repoIdTrimmed?blobs=true';
-    final resp =
-        await _dio.get<dynamic>(url, options: Options(headers: headers));
+    final resp = await _hfGet<dynamic>(url, options: Options(headers: headers));
     if (resp.data is! Map) {
       throw StateError('HF API returned unexpected payload for $repoIdTrimmed');
     }
@@ -687,8 +794,7 @@ class ModelService {
     }
     // `?blobs=true` surfaces per-file sizes in a stable shape.
     final url = 'https://huggingface.co/api/models/${repo.repoId}?blobs=true';
-    final resp =
-        await _dio.get<dynamic>(url, options: Options(headers: headers));
+    final resp = await _hfGet<dynamic>(url, options: Options(headers: headers));
     if (resp.data is! Map) return const [];
     final siblings = ((resp.data as Map)['siblings'] as List?) ?? const [];
 
@@ -805,7 +911,9 @@ class ModelService {
     final tempPath = '$localPath.tmp';
     await File(localPath).parent.create(recursive: true);
 
-    // Check if already downloaded and valid
+    // Check if already downloaded and valid. Early return happens BEFORE
+    // the download task is published, so route straight to the caller's
+    // callbacks (emit* closures are declared further down).
     if (await _isModelDownloaded(localPath, modelDef)) {
       onProgress?.call(1.0);
       onStatusChange?.call('Model already downloaded');
@@ -820,8 +928,30 @@ class ModelService {
     final cancelToken = CancelToken();
     _activeDowloads[modelName] = cancelToken;
 
+    // Publish the live download state on the service singleton: any screen
+    // can render it anywhere, and navigating away/back re-attaches without
+    // losing progress (the state is NOT owned by a screen).
+    final task = ModelDownloadTask(modelName, modelDef.displayName);
+    // Newest-first: prepend so the list stays sorted by start time
+    // descending (the most-recently-started download shows on top).
+    activeDownloads.value = [task, ...activeDownloads.value];
+
+    void emitProgress(double p) {
+      task.update(progress: p);
+      // Reassign a fresh list so ValueNotifier notifies even though we
+      // mutated the existing task object in place.
+      activeDownloads.value = [...activeDownloads.value];
+      onProgress?.call(p);
+    }
+
+    void emitStatus(String s) {
+      task.update(status: s);
+      activeDownloads.value = [...activeDownloads.value];
+      onStatusChange?.call(s);
+    }
+
     try {
-      onStatusChange?.call('Checking available space...');
+      emitStatus('Checking available space...');
 
       // Free-space precheck. `_getAvailableSpace` probes the real
       // filesystem (statvfs on POSIX, GetDiskFreeSpaceExW on Windows)
@@ -843,8 +973,8 @@ class ModelService {
         }
       }
 
-      onStatusChange?.call('Starting download...');
-      onProgress?.call(0.0);
+      emitStatus('Starting download...');
+      emitProgress(0.0);
 
       // Download → verify → on a checksum failure delete the bad file
       // and retry ONCE from scratch. A mismatch is almost always a
@@ -879,8 +1009,8 @@ class ModelService {
             modelDef.url,
             tempPath,
             expectedSize: modelDef.sizeBytes,
-            onProgress: onProgress,
-            onStatusChange: onStatusChange,
+            onProgress: emitProgress,
+            onStatusChange: emitStatus,
             cancelToken: cancelToken,
           );
           int realBytes = 0;
@@ -896,8 +1026,8 @@ class ModelService {
           rethrow;
         }
 
-        onStatusChange?.call('Verifying download...');
-        onProgress?.call(0.95);
+        emitStatus('Verifying download...');
+        emitProgress(0.95);
 
         // Verify download
         if (skipChecksum) {
@@ -920,8 +1050,8 @@ class ModelService {
               'resort enable "Skip checksum verification" in '
               'Settings → Debugging.');
         }
-        onStatusChange?.call('Verification failed — retrying download...');
-        onProgress?.call(0.0);
+        emitStatus('Verification failed — retrying download...');
+        emitProgress(0.0);
       }
 
       // Move temp file to final location
@@ -966,8 +1096,8 @@ class ModelService {
         await _maybeFetchCoreMLCompanion(modelDef, modelDir);
       }
 
-      onProgress?.call(1.0);
-      onStatusChange?.call('Download complete');
+      emitProgress(1.0);
+      emitStatus('Download complete');
       return true;
     } catch (e) {
       // Cleanup on failure — but only when the bytes on disk are of no
@@ -1021,6 +1151,14 @@ class ModelService {
       throw ModelException('Failed to download model: $e');
     } finally {
       _activeDowloads.remove(modelName);
+      // Navigation-proof bookkeeping: clear the live task and bump the
+      // generation so listening screens auto-refresh their local model
+      // info (success AND failure both count — a failed download must
+      // also un-pin the card and flip isDownloaded re-checks).
+      activeDownloads.value = activeDownloads.value
+          .where((t) => t.modelName != task.modelName)
+          .toList();
+      downloadGeneration.value++;
     }
   }
 
@@ -1035,9 +1173,483 @@ class ModelService {
 
   /// Download with byte-accurate resume.
   ///
-  /// Thin wrapper kept for the existing call sites; the protocol lives
-  /// in [DownloadEngine] so it can be exercised against a local
-  /// HttpServer in tests.
+  /// aria2 is desktop-only: on iOS / Android / web there is nothing to spawn,
+  /// so this returns null and every download uses the built-in engine (the
+  /// settings switch is likewise hidden off-desktop).
+  ///
+  /// Locate aria2c next to the app binary first, then in every PATH
+  /// directory. The desktop-generic name is plain `aria2c`; on Windows the
+  /// physical `.exe` form is also accepted because CreateProcess requires an
+  /// executable extension (the official Windows build ships aria2c.exe). A
+  /// shell shim without an executable form cannot be spawned and would
+  /// silently break the download path.
+  Future<String?> _findAria2c() async {
+    if (!plat.isDesktop) return null;
+    const exeName = 'aria2c';
+    final exeCandidates =
+        Platform.isWindows ? <String>[exeName, '$exeName.exe'] : <String>[exeName];
+    try {
+      final exeDir = File(Platform.resolvedExecutable).parent.path;
+      for (final name in exeCandidates) {
+        final local = path.join(exeDir, name);
+        if (await File(local).exists()) return local;
+      }
+    } catch (_) {
+      // Platform.resolvedExecutable unavailable in some test environments.
+    }
+    final dirs =
+        Platform.environment['PATH']?.split(Platform.isWindows ? ';' : ':') ??
+            const <String>[];
+    for (final d in dirs) {
+      final dir = d.trim();
+      if (dir.isEmpty) continue;
+      for (final name in exeCandidates) {
+        final cand = path.join(dir, name);
+        try {
+          if (await File(cand).exists()) return cand;
+        } catch (_) {
+          // Malformed PATH entry — skip.
+        }
+      }
+    }
+    return null;
+  }
+
+  /// Throughput in the same units and labels [DownloadEngine] uses for its
+  /// own progress line, so an aria2 download and a built-in-engine download
+  /// read identically in the UI.
+  static String _formatSpeed(int bytesPerSecond) {
+    if (bytesPerSecond < 1024) return '$bytesPerSecond B/s';
+    if (bytesPerSecond < 1024 * 1024) {
+      return '${(bytesPerSecond / 1024).toStringAsFixed(1)} KB/s';
+    }
+    return '${(bytesPerSecond / (1024 * 1024)).toStringAsFixed(1)} MB/s';
+  }
+
+  /// Download using aria2 in **command-line** mode — no RPC server, nothing
+  /// listening on a port. aria2 is handed the URL and opens its own 16
+  /// connections; we read its summary read-out for progress.
+  ///
+  /// **Single source, deliberately.** aria2 is handed exactly ONE URL: the
+  /// top entry of [_hfAttemptUrls] — i.e. whichever source the user put first
+  /// in Settings, or the origin when no mirror is configured. It never sees
+  /// the rest of the list, and it is never pointed at a second host.
+  ///
+  /// Why not let aria2 juggle several mirrors:
+  ///   * a 16-way segmented transfer cannot resume across hosts — the
+  ///     `.aria2` control file describes one server's byte layout, so a
+  ///     source switch means restarting from 0 anyway, wasting whatever a
+  ///     slow first source already delivered;
+  ///   * which host answers is decided by the user's Settings order here,
+  ///     not inside the external tool, so bookkeeping and logging stay in
+  ///     one place.
+  /// When this source fails, [_downloadWithResume] hands the download to the
+  /// in-process engine, which retries the *same* source — swapping hosts is
+  /// the user's decision (Settings > HF mirrors), never ours.
+  ///
+  /// Retries below are therefore retries of the SAME source only, each
+  /// resuming from aria2's control file. A source whose progress freezes is
+  /// abandoned immediately (waiting one out buys nothing) and costs us the
+  /// partial, which the sequential engine cannot resume either way.
+  ///
+  /// Progress caveat that shaped this method: with no tty, aria2 refreshes a
+  /// single line in place with `\r` and emits no percentage at all, so the UI
+  /// would look frozen. `--summary-interval=1` forces periodic summary lines,
+  /// which do carry `(NN%)`.
+  Future<void> _downloadWithAria2Cli(
+    String aria2,
+    String url,
+    String savePath, {
+    required int expectedSize,
+    void Function(double progress)? onProgress,
+    void Function(String status)? onStatusChange,
+    CancelToken? cancelToken,
+  }) async {
+    final attempts = _hfAttemptUrls(url);
+    final source = attempts.first; // ONE source: the user's first choice.
+    final label = Uri.tryParse(source)?.host ?? source;
+    // aria2 writes its own file (via --log), so it must respect the same
+    // switch as session.log: with the file sink disabled there is no --log
+    // flag at all. Fixed name aria2-cli.log; each download deletes the
+    // previous file first, so the log always describes the latest attempt
+    // and never grows unbounded.
+    String? aria2LogPath;
+    if (Log.instance.fileSinkEnabled) {
+      final logsDir = await Log.getLogsDirectory();
+      if (logsDir != null) {
+        aria2LogPath = path.join(logsDir, 'aria2-cli.log');
+        try {
+          await File(aria2LogPath).delete();
+        } catch (_) {
+          // First run, or the previous log is already gone.
+        }
+      }
+    }
+
+    Log.instance.i('model', 'aria2 (cli) download start', fields: {
+      'binary': aria2,
+      'target': savePath,
+      'expected_bytes': expectedSize,
+      'source': label,
+      'aria2_log': aria2LogPath,
+      // Informational only: how many hosts the list holds in total. Nothing
+      // walks it — see [_downloadWithResume].
+      'configured_sources': attempts.length,
+    });
+
+    const maxAttempts = 3;
+    Object? lastError;
+
+    for (var attempt = 1; attempt <= maxAttempts; attempt++) {
+      if (cancelToken?.isCancelled ?? false) {
+        await _cleanupTempFile(savePath);
+        await _cleanupTempFile('$savePath.aria2');
+        throw DioException(
+            requestOptions: RequestOptions(path: source),
+            type: DioExceptionType.cancel);
+      }
+      try {
+        await _aria2CliAttempt(
+          aria2,
+          source,
+          savePath,
+          resume: attempt > 1,
+          expectedSize: expectedSize,
+          aria2LogPath: aria2LogPath,
+          label: label,
+          onProgress: onProgress,
+          onStatusChange: onStatusChange,
+          cancelToken: cancelToken,
+        );
+        await _cleanupTempFile('$savePath.aria2');
+        onProgress?.call(1.0);
+        Log.instance.i('model', 'aria2 (cli) download done', fields: {
+          'target': savePath,
+          'attempt': attempt,
+          'url': source,
+        });
+        return;
+      } on DioException {
+        rethrow; // user cancellation — never retried
+      } on _Aria2Stalled catch (e) {
+        lastError = e;
+        break; // crawling: remaining retries would not help
+      } catch (e) {
+        lastError = e; // control file kept: the same source resumes below
+      }
+    }
+
+    Log.instance.w('model', 'aria2 source failed', fields: {
+      'source': label,
+      'attempts': maxAttempts,
+      'error': lastError.toString(),
+    });
+
+    // aria2's partial is 16-way segmented and useless to the sequential
+    // engine that takes over next, so drop it and let the caller fall
+    // through to that engine — which retries this very source, not a mirror:
+    // a source that failed three times is worth *one* more attempt with
+    // different mechanics (Dio + resume), and if it still fails the user
+    // picks a different host in Settings.
+    await _cleanupTempFile(savePath);
+    await _cleanupTempFile('$savePath.aria2');
+    throw ResumableDownloadException(
+      'aria2 failed on $label after $maxAttempts attempt(s). '
+      'Last error: $lastError',
+      bytesOnDisk: 0,
+    );
+  }
+
+  /// One aria2 CLI process for one URL — a single attempt on a single host.
+  ///
+  /// Throws [DioException] when the user cancelled, [_Aria2Stalled] when the
+  /// transfer stopped moving, and [ResumableDownloadException] for everything
+  /// else (non-zero exit, empty file, ...).
+  Future<void> _aria2CliAttempt(
+    String aria2,
+    String uri,
+    String savePath, {
+    required bool resume,
+    required int expectedSize,
+    required String? aria2LogPath,
+    required String label,
+    void Function(double progress)? onProgress,
+    void Function(String status)? onStatusChange,
+    CancelToken? cancelToken,
+  }) async {
+    final args = <String>[
+      '--dir=${path.dirname(savePath)}',
+      '--out=${path.basename(savePath)}',
+      '--continue=${resume ? 'true' : 'false'}',
+      '--auto-file-renaming=false',
+      '--allow-overwrite=true',
+      '--max-connection-per-server=16',
+      '--split=16',
+      '--min-split-size=4M',
+      '--file-allocation=none',
+      '--enable-color=false',
+      '--summary-interval=1',
+      '--console-log-level=warn',
+      '--download-result=hide',
+      if (aria2LogPath != null) '--log=$aria2LogPath',
+      '--log-level=info',
+    ];
+    final token = hfToken;
+    if (token != null && token.isNotEmpty) {
+      args.add('--header=Authorization: Bearer $token');
+    }
+    args.add(uri);
+
+    // Same proxy hygiene as the RPC path: env proxies are ignored or rejected
+    // outright by aria2, and the bare `host:port` form makes it exit at
+    // startup, which looks like "aria2 started and immediately quit".
+    final cleanEnv = Map<String, String>.from(Platform.environment)
+      ..removeWhere((k, _) => k.toLowerCase().endsWith('proxy'));
+
+    onStatusChange?.call('$label — downloading...');
+
+    final process = await Process.start(aria2, args, environment: cleanEnv);
+
+    // Tie the aria2c lifetime to this app process (Windows Job Object with
+    // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE): on normal exit, crash or a
+    // Task-Manager kill the OS drops the job handle and terminates aria2c —
+    // same mechanism as the audio.cpp server. The returned handle is
+    // deliberately never closed (closing it would kill the download);
+    // 0 means binding was unavailable (non-Windows / FFI failure), in which
+    // case the cancel/stall paths below still kill the child explicitly.
+    bindProcessToAppLifetimeJob(process.pid);
+
+    void killChild() {
+      try {
+        // Default signal, i.e. ProcessSignal.sigterm (the member really is
+        // spelled lowercase in dart:io — `sigKill` was a typo that broke the
+        // build with "Member not found"). `kill()` maps to TerminateProcess on
+        // Windows and is portable, so there is no reason to name a signal.
+        process.kill();
+      } catch (_) {
+        // Already gone.
+      }
+    }
+
+    if (cancelToken != null) {
+      if (cancelToken.isCancelled) {
+        killChild();
+        throw DioException(
+            requestOptions: RequestOptions(path: uri),
+            type: DioExceptionType.cancel);
+      }
+      cancelToken.whenCancel.then((_) => killChild());
+    }
+
+    // Real output, captured from aria2c 1.37.0 with exactly these flags:
+    //
+    //   *** Download Progress Summary as of Sat Oct 10 02:52:12 2026 ***
+    //   =======================================================================
+    //   [#127ffd 1.9MiB/74MiB(2%) CN:16 DL:2.0MiB ETA:35s]
+    //   FILE: ./out2.bin
+    //   --------------------------------------------------------------------
+    //
+    // Note `DL:2.0MiB` — the rate has NO trailing `/s` (a finished transfer
+    // even prints `DL:0B`), which is why `/s` is optional below rather than
+    // assumed. Every interval re-emits the block and then the same summary
+    // line once more, `\r`-separated and with no trailing newline, so a line
+    // can arrive in several pieces: parsing a rolling window instead of each
+    // chunk in isolation keeps a summary cut mid-`MiB` readable, and taking
+    // the window's LAST `[#…]` line avoids fields from the previous interval
+    // going stale.
+    const unitBytes = <String, double>{
+      '': 1.0,
+      'K': 1024.0,
+      'M': 1024.0 * 1024.0,
+      'G': 1024.0 * 1024.0 * 1024.0,
+    };
+    final win = StringBuffer();
+    final pctRe = RegExp(r'\((\d{1,3})%\)');
+    final dlRe = RegExp(r'DL:\s*([0-9]+(?:\.[0-9]+)?)\s*([KMG]?)i?B(?:/s)?');
+    final etaRe = RegExp(r'ETA:\s*([^\s\]]+)');
+    final tail = StringBuffer();
+    var lastPct = -1;
+    var lastChangeAt = DateTime.now();
+    int? speedBps;
+    var eta = '';
+    var shownPct = -1;
+    var shownSpeed = '';
+    var shownEta = '';
+    void pump(String chunk) {
+      // Keep only a bounded tail: it exists purely to explain a failure, and
+      // it must collect every chunk even when the summary line it belongs to
+      // is still incomplete.
+      tail.write(chunk);
+      if (tail.length > 4000) {
+        final s = tail.toString();
+        tail.clear();
+        tail.write(s.substring(s.length - 2000));
+      }
+      win.write(chunk);
+      if (win.length > 4096) {
+        final s = win.toString();
+        win.clear();
+        win.write(s.substring(s.length - 2048));
+      }
+      // Take the most recent summary line, not merely the last non-empty one:
+      // a chunk boundary can land right after the `FILE:` / separator lines
+      // that follow every summary.
+      var line = '';
+      final lines = win.toString().replaceAll('\r', '\n').split('\n');
+      for (var i = lines.length - 1; i >= 0; i--) {
+        final s = lines[i].trim();
+        if (s.startsWith('[#')) {
+          line = s;
+          break;
+        }
+      }
+      // Only a *complete* line is meaningful. A half-read one still ends up in
+      // the rolling window, so it will be parsed once its tail arrives;
+      // reading it now would flash values like "ETA 3" mid-assembly.
+      if (!line.endsWith(']')) return;
+
+      final dl = dlRe.allMatches(line);
+      if (dl.isNotEmpty) {
+        final m = dl.last;
+        final v = double.tryParse(m.group(1) ?? '');
+        if (v != null) {
+          speedBps = (v * (unitBytes[m.group(2) ?? ''] ?? 1.0)).round();
+        }
+      }
+      final etas = etaRe.allMatches(line);
+      if (etas.isNotEmpty) {
+        final e = etas.last.group(1) ?? '';
+        eta = e == '-' ? '' : e; // '-' is aria2's "unknown"
+      } else {
+        eta = '';
+      }
+
+      var pct = lastPct;
+      final pcts = pctRe.allMatches(line);
+      if (pcts.isNotEmpty) {
+        final v = int.tryParse(pcts.last.group(1) ?? '');
+        if (v != null) {
+          if (v != lastPct) {
+            lastPct = v;
+            lastChangeAt = DateTime.now();
+          }
+          pct = v;
+        }
+      }
+      // A reporting DL above zero means bytes are actually moving, which the
+      // percentage alone cannot show: 1% of a 5 GB model takes minutes even
+      // on a healthy connection, and the stall guard below would otherwise
+      // kill a perfectly good transfer that simply hadn't crossed a percent
+      // boundary yet.
+      if ((speedBps ?? 0) > 0) lastChangeAt = DateTime.now();
+      if (pct >= 0) {
+        onProgress?.call((pct.clamp(0, 100)) / 100.0);
+        final speed = speedBps == null ? '' : _formatSpeed(speedBps!);
+        // Emit once per *change*, not once per match: the window keeps being
+        // re-scanned every tick, and a status string that never changes would
+        // otherwise rebuild the UI ~2x/second for nothing.
+        if (pct != shownPct || speed != shownSpeed || eta != shownEta) {
+          shownPct = pct;
+          shownSpeed = speed;
+          shownEta = eta;
+          onStatusChange?.call([
+            '$label — $pct%',
+            if (speed.isNotEmpty) speed,
+            if (eta.isNotEmpty) 'ETA $eta',
+          ].join(' · '));
+        }
+      }
+    }
+
+    final stdoutSub = process.stdout.transform(systemEncoding.decoder).listen(
+      (s) {
+        pump(s);
+      },
+      onError: (_) {},
+      cancelOnError: false,
+    );
+    final stderrSub = process.stderr.transform(systemEncoding.decoder).listen(
+      (s) {
+        pump(s);
+      },
+      onError: (_) {},
+      cancelOnError: false,
+    );
+
+    // Stall guard. There is no tty, so nothing is being redrawn in place that
+    // we could miss — "nothing moved for N seconds" is reliable enough, and
+    // aborting beats sitting on a crawling host forever. Liveness is judged on
+    // both signals the summary line gives us: a new percentage *or* a
+    // non-zero DL reading (see above).
+    final stalled = Completer<_Aria2Stalled>();
+    final timer = Timer.periodic(const Duration(milliseconds: 500), (_) {
+      if (stalled.isCompleted) return;
+      if (cancelToken?.isCancelled ?? false) return; // cancellation wins
+      final idle = DateTime.now().difference(lastChangeAt);
+      // Generous grace before the first summary line ever arrives: DNS, the
+      // redirect chain and 16 handshakes legitimately take seconds on a cold
+      // host, and aborting there would throw away a perfectly fine transfer.
+      final graceSeconds = lastPct < 0 ? 60 : 10;
+      if (idle.inSeconds >= graceSeconds) {
+        killChild();
+        stalled.complete(_Aria2Stalled('$label stalled ${idle.inSeconds}s at '
+            '${lastPct < 0 ? 'connection setup' : '$lastPct%'}'));
+      }
+    });
+
+    try {
+      final outcome = await Future.any<Object?>(<Future<Object?>>[
+        process.exitCode,
+        stalled.future,
+      ]);
+      if (outcome is _Aria2Stalled) {
+        await _cleanupTempFile(savePath);
+        await _cleanupTempFile('$savePath.aria2');
+        throw outcome;
+      }
+      final exit = outcome as int;
+      if (cancelToken?.isCancelled ?? false) {
+        throw DioException(
+            requestOptions: RequestOptions(path: uri),
+            type: DioExceptionType.cancel);
+      }
+      if (exit != 0) {
+        // lengthSync throws when the file was never created; never let that
+        // mask the real aria2 error we are about to report.
+        var already = 0;
+        try {
+          already = File(savePath).lengthSync();
+        } catch (_) {}
+        throw ResumableDownloadException(
+            'aria2 exited with $exit: ${tail.toString().trim()}',
+            bytesOnDisk: already);
+      }
+      final f = File(savePath);
+      if (!await f.exists()) {
+        throw const ResumableDownloadException(
+            'aria2 reported success but produced no file',
+            bytesOnDisk: 0);
+      }
+      final len = await f.length();
+      // sizeBytes in the catalogue is sometimes a different variant than the
+      // file actually served, so only treat "nothing written" as fatal —
+      // a mismatch is logged and left to the resume/verify logic downstream
+      // rather than failing a download that may well be complete.
+      if (len == 0) {
+        throw const ResumableDownloadException('aria2 wrote an empty file',
+            bytesOnDisk: 0);
+      }
+      if (expectedSize > 0 && len != expectedSize) {
+        Log.instance.w('model', 'aria2 size differs from catalogue',
+            fields: {'bytes': len, 'expected': expectedSize});
+      }
+    } finally {
+      timer.cancel();
+      await stdoutSub.cancel();
+      await stderrSub.cancel();
+    }
+  }
+
   Future<void> _downloadWithResume(
     String url,
     String savePath, {
@@ -1045,11 +1657,69 @@ class ModelService {
     void Function(double progress)? onProgress,
     void Function(String status)? onStatusChange,
     CancelToken? cancelToken,
-  }) {
-    return DownloadEngine(_dio, authToken: hfToken).download(
-      url,
+  }) async {
+    // External aria2 first when the user enabled it and it is available next
+    // to the binary or on PATH; otherwise straight to the in-process engine.
+    final aria2 =
+        _settingsService.useAria2Downloads ? await _findAria2c() : null;
+    if (aria2 != null) {
+      try {
+        // The external downloader is always driven in **command-line** mode
+        // now: the JSON-RPC transport was retired (see [_downloadWithAria2Cli]).
+        await _downloadWithAria2Cli(
+          aria2,
+          url,
+          savePath,
+          expectedSize: expectedSize,
+          onProgress: onProgress,
+          onStatusChange: onStatusChange,
+          cancelToken: cancelToken,
+        );
+        return;
+      } on DioException {
+        rethrow; // user cancellation (and real HTTP-level cancels)
+      } catch (e, st) {
+        // IMPORTANT: always fall through to the in-process engine below. A
+        // hard failure here used to take the whole download down with it and
+        // left no way to fetch the model at all.
+        Log.instance.w('model', 'aria2 failed — built-in engine takes over',
+            error: e, stack: st);
+      }
+    }
+
+    // Single source, deliberately: the top entry of [_hfAttemptUrls] —
+    // whichever host the user put first in Settings, or the origin when no
+    // mirror is configured. Exactly the choice aria2 gets above.
+    //
+    // This used to walk the whole mirror list. That stopped paying off once
+    // downloads became resumable: a mid-transfer hiccup or a slow response
+    // from the first host restarted a multi-GB transfer somewhere else, so
+    // one flaky half-minute could cost several times longer than just
+    // waiting it out. The "partial is still valid across hosts" argument was
+    // thin anyway — nothing guarantees two mirrors serve byte-identical
+    // files. Picking a source is now a single up-front decision the user
+    // makes in Settings, not something we do to them mid-download.
+    //
+    // Errors propagate as-is: cancellation reaches the UI as a DioException,
+    // everything else as whatever the engine raised.
+    final source = _hfAttemptUrls(url).first;
+    Log.instance.i('model', 'built-in engine download start', fields: {
+      'source': Uri.tryParse(source)?.host ?? source,
+      'target': savePath,
+      'expected_bytes': expectedSize,
+    });
+    // Honour the built-in downloader's segmentation setting: 0/1 means
+    // "off" (single connection, sequential engine); 2/4/8 selects the
+    // parallel-connection count for large files.
+    final seg = _settingsService.parallelDownloadConnections;
+    await DownloadEngine(_dio, authToken: hfToken).download(
+      source,
       savePath,
       expectedSize: expectedSize,
+      // seg>=2 selects the parallel-connection count; otherwise the
+      // sequential engine is used (connections value is irrelevant).
+      connections: seg < 2 ? 4 : seg,
+      allowParallel: seg >= 2,
       onProgress: onProgress,
       onStatusChange: onStatusChange,
       cancelToken: cancelToken,
@@ -1515,10 +2185,30 @@ class ModelService {
     try {
       Log.instance
           .i('coreml', 'fetching CoreML companion', fields: {'url': zipUrl});
-      final resp = await _dio.download(zipUrl, zipPath);
-      if (resp.statusCode != 200) {
-        Log.instance.d(
-            'coreml', 'CoreML companion not on HF (status ${resp.statusCode})');
+      // Single source, same rule as the model download itself: the first
+      // configured mirror, no walking (see [_downloadWithResume]). A miss
+      // here only costs CoreML acceleration — whisper falls back to ggml —
+      // but it is no longer invisible in the log, so a wrongly-ordered
+      // mirror list shows up instead of silently costing every download.
+      final host = _hfAttemptUrls(zipUrl).first;
+      Response<dynamic>? resp;
+      try {
+        resp = await _dio.download(host, zipPath);
+      } on DioException catch (e) {
+        if (e.type == DioExceptionType.cancel) rethrow;
+        final code = e.response?.statusCode ?? 0;
+        // A 4xx (other than 429) means this host doesn't carry the file —
+        // folded into the "not available" branch below. Every other failure
+        // is transport trouble and leaves through the outer catch.
+        if (code < 400 || code >= 500 || code == 429) rethrow;
+      }
+      if (resp == null || resp.statusCode != 200) {
+        Log.instance.w(
+            'coreml',
+            'CoreML companion unavailable on the first source — this model '
+            'runs on ggml instead. Put a different HF host first in Settings '
+            'to try another one.',
+            fields: {'host': host, 'status': resp?.statusCode});
         await File(zipPath).delete().catchError((_) => File(zipPath));
         return;
       }
@@ -1648,6 +2338,13 @@ class DownloadEngine {
   /// download doesn't stutter the UI thread with thousands of rebuilds.
   static const int _progressIntervalMs = 250;
 
+  /// Multi-connection tuning: files below [..MinSize] go single-connection
+  /// (setup cost dominates); 4 workers x 32 MiB blocks keep every socket
+  /// busy on a 5 GB model while capping in-flight memory.
+  static const int _parallelMinSize = 64 * 1024 * 1024;
+  static const int _parallelConnections = 4;
+  static const int _parallelBlockSize = 32 * 1024 * 1024;
+
   DateTime? _speedStart;
   int _speedStartBytes = 0;
 
@@ -1661,12 +2358,38 @@ class DownloadEngine {
     String url,
     String savePath, {
     required int expectedSize,
+    int connections = _parallelConnections,
+    bool allowParallel = true,
     void Function(double progress)? onProgress,
     void Function(String status)? onStatusChange,
     CancelToken? cancelToken,
   }) async {
     _speedStart = null;
     _speedStartBytes = 0;
+
+    // Fast path: multi-connection download for large files when the host
+    // honours Range requests (hf-mirror and huggingface.co both do). Any
+    // failure here falls back to the sequential engine below from byte 0 --
+    // the parallel engine writes a pre-allocated file non-sequentially, so
+    // its partial is useless for the sequential resume logic.
+    if (allowParallel && expectedSize >= _parallelMinSize) {
+      try {
+        final ok = await downloadParallel(
+          url,
+          savePath,
+          connections: connections,
+          expectedSize: expectedSize,
+          onProgress: onProgress,
+          onStatusChange: onStatusChange,
+          cancelToken: cancelToken,
+        );
+        if (ok) return;
+      } on DioException {
+        rethrow; // user cancellation must propagate
+      } catch (_) {
+        // unsupported / transient failure -- sequential engine takes over.
+      }
+    }
 
     final restart = await _attempt(
       url,
@@ -1694,6 +2417,194 @@ class DownloadEngine {
         onStatusChange: onStatusChange,
         cancelToken: cancelToken,
       );
+    }
+  }
+
+  /// Multi-connection download. Probes the host with a 1-byte Range GET
+  /// (a HEAD is unreliable here -- some CDNs 502 it while full GETs work)
+  /// and, when ranged requests are honoured, writes the file via
+  /// [connections] concurrent workers pulling 32 MiB blocks off a shared
+  /// queue into pre-allocated storage. Throws [ParallelDownloadUnsupported]
+  /// when the host ignores Range, and [ResumableDownloadException] (after
+  /// deleting the partial) on mid-transfer failure -- both tell the caller
+  /// to fall back to the sequential engine. Returns true on success.
+  Future<bool> downloadParallel(
+    String url,
+    String savePath, {
+    required int connections,
+    required int expectedSize,
+    void Function(double progress)? onProgress,
+    void Function(String status)? onStatusChange,
+    CancelToken? cancelToken,
+  }) async {
+    final headers = <String, dynamic>{
+      'Accept': '*/*',
+      'Accept-Encoding': 'identity',
+    };
+    final token = authToken;
+    if (token != null && token.isNotEmpty) {
+      headers['Authorization'] = 'Bearer $token';
+    }
+
+    // 1-byte probe: 206 + Content-Range proves Range support AND gives the
+    // true total length (which the catalogue estimate may not).
+    final probe = await dio.get<ResponseBody>(
+      url,
+      options: Options(
+        responseType: ResponseType.stream,
+        headers: {...headers, 'Range': 'bytes=0-0'},
+        validateStatus: (s) => s != null && (s < 300 || s == 416),
+      ),
+      cancelToken: cancelToken,
+    );
+    final probeStatus = probe.statusCode ?? 0;
+    final probeRange =
+        _parseContentRange(probe.headers.value(HttpHeaders.contentRangeHeader));
+    final body = probe.data;
+    if (body != null) await _discard(body);
+    final total = probeStatus == 206 ? probeRange?.total : null;
+    if (total == null || total < _parallelMinSize) {
+      throw const ParallelDownloadUnsupported();
+    }
+
+    final effective = connections.clamp(2, 8);
+    onStatusChange?.call(
+        'Multi-connection download: $effective connections, ${_humanBytes(total)}');
+
+    final file = File(savePath);
+    final raf = await file.open(mode: FileMode.write); // truncates
+    var rafClosed = false;
+    Future<void> closeRaf() async {
+      // Idempotent: the finally below and the error paths can both reach
+      // this, and closing an already-closed RandomAccessFile throws.
+      if (rafClosed) return;
+      rafClosed = true;
+      try {
+        await raf.close();
+      } catch (_) {}
+    }
+
+    try {
+      await raf.truncate(total); // pre-allocate (sparse on NTFS/ext4)
+
+      var received = 0;
+      var lastTick = 0;
+      _speedStart = null;
+      _speedStartBytes = 0;
+      void bump(int n) {
+        received += n;
+        final now = DateTime.now();
+        final ms = now.millisecondsSinceEpoch;
+        if (ms - lastTick >= _progressIntervalMs) {
+          lastTick = ms;
+          if (total > 0) {
+            onProgress?.call((received / total).clamp(0.0, 1.0));
+          }
+          onStatusChange?.call(
+              'Downloaded ${(received / (1024 * 1024)).toStringAsFixed(1)} MB '
+              'of ${(total / (1024 * 1024)).toStringAsFixed(1)} MB '
+              '(${_speed(received, now)}, $effective connections)');
+        }
+      }
+
+      // Shared block queue: [start, endInclusive] pairs, 32 MiB each.
+      final blocks = <List<int>>[];
+      for (var s = 0; s < total; s += _parallelBlockSize) {
+        final e = (s + _parallelBlockSize - 1).clamp(0, total - 1);
+        blocks.add([s, e]);
+      }
+      var next = 0;
+      final failures = <String>[];
+
+      Future<void> worker() async {
+        while (failures.isEmpty && (cancelToken?.isCancelled != true)) {
+          final i = next++;
+          if (i >= blocks.length) return;
+          final start = blocks[i][0];
+          final end = blocks[i][1];
+          try {
+            final resp = await dio.get<ResponseBody>(
+              url,
+              options: Options(
+                responseType: ResponseType.stream,
+                headers: {
+                  ...headers,
+                  'Range': 'bytes=$start-$end',
+                },
+                // Anything but a clean 206 means this host is not playing
+                // ball with ranged requests right now.
+                validateStatus: (s) => s != null && s == 206,
+              ),
+              cancelToken: cancelToken,
+            );
+            final st = resp.statusCode ?? 0;
+            final b = resp.data;
+            if (st != 206 || b == null) {
+              if (b != null) await _discard(b);
+              failures.add('block $i: HTTP $st');
+              return;
+            }
+            var pos = start;
+            try {
+              await for (final chunk in b.stream) {
+                // RandomAccessFile async ops are serialized on the same
+                // isolate, so concurrent workers writing disjoint ranges
+                // are safe.
+                await raf.setPosition(pos);
+                await raf.writeFrom(chunk);
+                pos += chunk.length;
+                bump(chunk.length);
+              }
+            } catch (e) {
+              failures.add('block $i stream error: $e');
+              return;
+            }
+            if (pos != end + 1) {
+              failures.add(
+                  'block $i short: got $pos bytes, wanted ${end + 1}');
+              return;
+            }
+          } on DioException catch (e) {
+            if (e.type == DioExceptionType.cancel) rethrow;
+            failures.add('block $i: ${e.message ?? e.type.name}');
+            return;
+          }
+        }
+      }
+
+      try {
+        await Future.wait(
+            [for (var i = 0; i < effective; i++) worker()]);
+      } finally {
+        await closeRaf();
+      }
+
+      if (cancelToken?.isCancelled ?? false) {
+        await _deleteQuietly(file);
+        throw DioException(
+            requestOptions: RequestOptions(path: url),
+            type: DioExceptionType.cancel);
+      }
+      if (failures.isNotEmpty || received != total) {
+        // Non-sequential partial: useless for the sequential engine. Delete
+        // and fall back from byte 0.
+        await _deleteQuietly(file);
+        throw ResumableDownloadException(
+          'multi-connection download failed: '
+          '${failures.isEmpty ? 'incomplete' : failures.first}',
+          bytesOnDisk: 0,
+        );
+      }
+      onProgress?.call(1.0);
+      return true;
+    } on DioException {
+      await closeRaf();
+      await _deleteQuietly(file);
+      rethrow; // user cancellation
+    } catch (_) {
+      await closeRaf();
+      await _deleteQuietly(file);
+      rethrow;
     }
   }
 
@@ -1988,6 +2899,43 @@ class DownloadEngine {
     }
     return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(1)} GB';
   }
+}
+
+/// Snapshot of the in-flight model download. Owned by ModelService
+/// (navigation-proof): screens render it wherever the model card is.
+class ModelDownloadTask {
+  ModelDownloadTask(this.modelName, this.displayName)
+      : startedAt = DateTime.now();
+  final String modelName;
+  final String displayName;
+  final DateTime startedAt;
+  double progress = 0; // 0..1
+  String status = '';  // includes speed when available
+
+  void update({double? progress, String? status}) {
+    if (progress != null) this.progress = progress.clamp(0.0, 1.0);
+    if (status != null) this.status = status;
+  }
+}
+
+/// Thrown by the aria2 **command-line** path when a source stopped making
+/// measurable progress. Carries the message so the mirror walk can report it
+/// as the reason the host was abandoned.
+class _Aria2Stalled implements Exception {
+  const _Aria2Stalled(this.message);
+  final String message;
+
+  @override
+  String toString() => message;
+}
+
+/// Raised by DownloadEngine.downloadParallel when the source does not
+/// honour Range requests (no 206/Content-Range) -- the caller falls back
+/// to the single-connection sequential engine.
+class ParallelDownloadUnsupported implements Exception {
+  const ParallelDownloadUnsupported();
+  @override
+  String toString() => 'ParallelDownloadUnsupported';
 }
 
 // Retry interceptor for Dio

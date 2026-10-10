@@ -120,8 +120,10 @@ class _MusicTranscriptionScreenState
       );
       if (path == null) return;
       // Mobile pickers write `bytes` themselves; desktop returns a path.
-      if (plat.isDesktop) await File(path).writeAsBytes(bytes, flush: true);
-      if (mounted) _toast(l.musicSavedTo(path));
+      if (plat.isDesktop) {
+        await File(path.toFilePath()).writeAsBytes(bytes, flush: true);
+      }
+      if (mounted) _toast(l.musicSavedTo(path.toFilePath()));
     } catch (e, st) {
       Log.instance.e('music', 'MIDI save failed', error: e, stack: st);
       if (mounted) _toast(e.toString());

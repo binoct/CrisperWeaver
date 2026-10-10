@@ -562,6 +562,90 @@ abstract class AppLocalizations {
   /// **'Not set (required for gated models)'**
   String get settingsHfTokenNotSet;
 
+  /// No description provided for @settingsHfMirrors.
+  ///
+  /// In en, this message translates to:
+  /// **'HuggingFace mirrors'**
+  String get settingsHfMirrors;
+
+  /// No description provided for @settingsHfMirrorsSubtitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Model downloads use only the top entry; HF API probes still try the list top-down. Put your fastest host first.'**
+  String get settingsHfMirrorsSubtitle;
+
+  /// No description provided for @settingsHfMirrorAdd.
+  ///
+  /// In en, this message translates to:
+  /// **'Add mirror'**
+  String get settingsHfMirrorAdd;
+
+  /// No description provided for @settingsUseAria2.
+  ///
+  /// In en, this message translates to:
+  /// **'Use Aria2 for model downloads'**
+  String get settingsUseAria2;
+
+  /// No description provided for @settingsUseAria2Desc.
+  ///
+  /// In en, this message translates to:
+  /// **'When aria2c is available on the system, downloads use 16 parallel connections from a single source; on failure the built-in engine takes over.'**
+  String get settingsUseAria2Desc;
+
+  /// No description provided for @settingsSegmentedDownload.
+  ///
+  /// In en, this message translates to:
+  /// **'Segmented download (built-in)'**
+  String get settingsSegmentedDownload;
+
+  /// No description provided for @settingsSegmentedDownloadDesc.
+  ///
+  /// In en, this message translates to:
+  /// **'Multi-connection download for the built-in engine. Off uses a single connection.'**
+  String get settingsSegmentedDownloadDesc;
+
+  /// No description provided for @settingsSegmentedOff.
+  ///
+  /// In en, this message translates to:
+  /// **'Off (single connection)'**
+  String get settingsSegmentedOff;
+
+  /// No description provided for @settingsHfMirrorInvalid.
+  ///
+  /// In en, this message translates to:
+  /// **'Enter an http(s):// URL'**
+  String get settingsHfMirrorInvalid;
+
+  /// No description provided for @settingsHfMirrorDuplicate.
+  ///
+  /// In en, this message translates to:
+  /// **'Already in the list'**
+  String get settingsHfMirrorDuplicate;
+
+  /// No description provided for @settingsHfMirrorsRestore.
+  ///
+  /// In en, this message translates to:
+  /// **'Restore defaults'**
+  String get settingsHfMirrorsRestore;
+
+  /// No description provided for @settingsHfMirrorMoveUp.
+  ///
+  /// In en, this message translates to:
+  /// **'Move up'**
+  String get settingsHfMirrorMoveUp;
+
+  /// No description provided for @settingsHfMirrorMoveDown.
+  ///
+  /// In en, this message translates to:
+  /// **'Move down'**
+  String get settingsHfMirrorMoveDown;
+
+  /// No description provided for @settingsHfMirrorDelete.
+  ///
+  /// In en, this message translates to:
+  /// **'Remove'**
+  String get settingsHfMirrorDelete;
+
   /// No description provided for @settingsModelsDir.
   ///
   /// In en, this message translates to:

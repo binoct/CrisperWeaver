@@ -112,6 +112,35 @@ class Log {
   static final Log _instance = Log._();
   static Log get instance => _instance;
 
+  /// Cached path to the app's `logs/` directory — the same directory that
+  /// holds `session.log`. Populated the first time the file sink is enabled;
+  /// [getLogsDirectory] computes and creates it on demand if it was never
+  /// set (e.g. before startup, or on a fresh launch).
+  static String? _logsDirPath;
+
+  /// The app's `logs/` directory, or null if the file sink has not been
+  /// enabled yet and [getLogsDirectory] has not been called.
+  String? get logsDirectory => _logsDirPath;
+
+  /// Resolves the app's `logs/` directory — the home of `session.log` and
+  /// (now) aria2's own log file. Returns null only on web, where there is
+  /// no document filesystem. Safe to call any time; never throws.
+  static Future<String?> getLogsDirectory() async {
+    if (_logsDirPath != null) return _logsDirPath;
+    if (kIsWeb) return null;
+    try {
+      final docs = await getApplicationDocumentsDirectory();
+      final dir = Directory(p.join(docs.path, 'logs'));
+      if (!await dir.exists()) await dir.create(recursive: true);
+      _logsDirPath = dir.path;
+      return _logsDirPath;
+    } catch (err, st) {
+      Log.instance.e('log', 'failed to resolve logs directory',
+          error: err, stack: st);
+      return null;
+    }
+  }
+
   /// `IOSink.writeln` only *queues* bytes: a write that fails does so later,
   /// in the event loop, and the failure is delivered on `stdout`/`stderr`'s
   /// `done` future. With nobody listening it becomes an unhandled async
@@ -231,6 +260,7 @@ class Log {
         if (!await logsDir.exists()) {
           await logsDir.create(recursive: true);
         }
+        _logsDirPath = logsDir.path;
         _sinkFile = File(p.join(logsDir.path, 'session.log'));
         _sink = _sinkFile!.openWrite(mode: FileMode.append);
         _fileSink = true;
@@ -468,6 +498,7 @@ class Log {
     if (!await logsDir.exists()) {
       await logsDir.create(recursive: true);
     }
+    _logsDirPath = logsDir.path;
     final stamp =
         DateTime.now().toIso8601String().replaceAll(':', '').split('.').first;
     final file = File(p.join(logsDir.path, 'crisperweaver-$stamp.log'));

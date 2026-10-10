@@ -247,6 +247,49 @@ class AppLocalizationsZh extends AppLocalizations {
   String get settingsHfTokenNotSet => '未设置（访问门控模型时必填）';
 
   @override
+  String get settingsHfMirrors => 'HuggingFace 镜像';
+
+  @override
+  String get settingsHfMirrorsSubtitle =>
+      '模型下载只使用列表中的第一个源；HF API 探测则自上而下依次尝试。请把自己最快的源排到最前。';
+
+  @override
+  String get settingsHfMirrorAdd => '添加镜像';
+
+  @override
+  String get settingsUseAria2 => '使用 Aria2 下载模型';
+
+  @override
+  String get settingsUseAria2Desc => '系统环境有 aria2c 时启用 16 线程单源下载；失败则交给内置下载器重试。';
+
+  @override
+  String get settingsSegmentedDownload => '分段下载（内置下载器）';
+
+  @override
+  String get settingsSegmentedDownloadDesc => '内置下载器使用多连接分段下载；选“关闭”则使用单连接。';
+
+  @override
+  String get settingsSegmentedOff => '关闭（单连接）';
+
+  @override
+  String get settingsHfMirrorInvalid => '请输入 http(s):// 地址';
+
+  @override
+  String get settingsHfMirrorDuplicate => '已在列表中';
+
+  @override
+  String get settingsHfMirrorsRestore => '恢复默认';
+
+  @override
+  String get settingsHfMirrorMoveUp => '上移';
+
+  @override
+  String get settingsHfMirrorMoveDown => '下移';
+
+  @override
+  String get settingsHfMirrorDelete => '移除';
+
+  @override
   String get settingsModelsDir => '模型目录';
 
   @override

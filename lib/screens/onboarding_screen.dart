@@ -80,6 +80,10 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
   bool _working = false;
   double _progress = 0;
   String? _status;
+
+  /// The model currently being fetched inside [_finish], so the Stop button
+  /// can cancel exactly that transfer.
+  String? _downloadingName;
   late Future<List<ModelInfo>> _models;
 
   @override
@@ -317,6 +321,18 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
                       LinearProgressIndicator(value: _progress),
                       const SizedBox(height: 6),
                       Text(_status ?? l.onboardingPreparing),
+                      const SizedBox(height: 8),
+                      // Even the first-run download must be abortable: it can
+                      // be hundreds of megabytes on a slow link, and offering
+                      // only a creeping progress bar traps the user here.
+                      Align(
+                        alignment: AlignmentDirectional.centerStart,
+                        child: TextButton.icon(
+                          icon: const Icon(Icons.stop_circle_outlined),
+                          label: Text(l.stop),
+                          onPressed: _stopDownload,
+                        ),
+                      ),
                     ],
                   ],
                 ),
@@ -325,6 +341,16 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
           );
         },
       );
+
+  Future<void> _stopDownload() async {
+    final name = _downloadingName;
+    if (name == null) return;
+    try {
+      await ref.read(modelServiceProvider).cancelDownload(name);
+    } catch (_) {
+      // The download is being torn down; nothing useful to surface here.
+    }
+  }
 
   Future<void> _finish() async {
     setState(() {
@@ -350,6 +376,7 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
         for (var i = 0; i < names.length; i++) {
           if (!mounted) return;
           final name = names[i];
+          _downloadingName = name;
           await service.downloadWhisperCppModel(
             name,
             onStatusChange: (status) {
@@ -386,14 +413,19 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
       }
     } catch (e) {
       if (!mounted) return;
+      // Distinguish "the user pressed Stop" from a genuine failure: showing
+      // the onboarding-failed toast for their own cancellation reads as a bug.
+      final cancelled = e.toString().toLowerCase().contains('cancel');
       setState(() {
         _working = false;
         _status = e.toString();
       });
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-            content: Text(
-                AppLocalizations.of(context).onboardingFailed(e.toString()))),
+            content: Text(cancelled
+                ? AppLocalizations.of(context).stop
+                : AppLocalizations.of(context)
+                    .onboardingFailed(e.toString()))),
       );
     }
   }
