@@ -10,13 +10,9 @@
 
 name: Deploy Web
 
+# Auto triggers (push / pull_request) intentionally disabled — run
+# manually from the Actions tab.
 on:
-  push:
-    branches: [main]
-    tags:
-      - "v*"
-  pull_request:
-    branches: [main]
   workflow_dispatch:
     inputs:
       validate_only:

@@ -3,10 +3,9 @@ name: Release
 # Triggered by pushing a tag like `v1.2.3`. Builds release artifacts and
 # attaches them to the matching GitHub Release. The Release itself is
 # auto-created if it doesn't already exist.
+# Auto trigger (push v* tag) intentionally disabled — build releases
+# manually from the Actions tab and pick the platform.
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
     inputs:
       tag:
