@@ -6,8 +6,9 @@ name: Compile Check
 # and nothing is pushed to App Store Connect / TestFlight. Signing is
 # test-grade: Android uses the release signing secrets when present and
 # otherwise falls back to the Gradle debug keystore; iOS ships only an
-# unsigned --no-codesign IPA for sideload re-signing. Triggered manually
-# from the Actions tab; builds whatever ref the dispatch ran on (branch,
+# unsigned --no-codesign IPA for sideload re-signing. Every build also gets
+# --dart-define=CW_NONCOMMERCIAL_MODELS=true so the non-commercial model
+# catalogue is enabled. Triggered manually from the Actions tab; builds whatever ref the dispatch ran on (branch,
 # tag, or SHA). Download artefacts from the run summary page ("Artifacts").
 on:
   workflow_dispatch:
@@ -144,7 +145,7 @@ jobs:
 
       - name: Build macOS (Release)
         working-directory: repos/CrisperWeaver
-        run: flutter build macos --release
+        run: flutter build macos --release --dart-define=CW_NONCOMMERCIAL_MODELS=true
 
       - name: Bundle all CrispASR + glint dylibs + ad-hoc sign
         working-directory: repos/CrisperWeaver
@@ -279,7 +280,7 @@ jobs:
 
       - name: Build Linux (Release)
         working-directory: repos/CrisperWeaver
-        run: flutter build linux --release
+        run: flutter build linux --release --dart-define=CW_NONCOMMERCIAL_MODELS=true
 
       - name: Bundle libcrispasr.so + libglint into bundle/lib/
         working-directory: repos/CrisperWeaver
@@ -554,7 +555,7 @@ jobs:
 
       - name: Build APK (release)
         working-directory: repos/CrisperWeaver
-        run: flutter build apk --release --target-platform=android-arm64
+        run: flutter build apk --release --target-platform=android-arm64 --dart-define=CW_NONCOMMERCIAL_MODELS=true
 
       - name: Rename APK
         working-directory: repos/CrisperWeaver
@@ -681,7 +682,7 @@ jobs:
 
       - name: Build iOS (no codesign — Flutter step)
         working-directory: repos/CrisperWeaver
-        run: flutter build ios --release --no-codesign
+        run: flutter build ios --release --no-codesign --dart-define=CW_NONCOMMERCIAL_MODELS=true
 
       # The only iOS artefact: unsigned sideload IPA (AltStore / SideStore /
       # Feather re-sign). This is a compile test — no Distribution signing
@@ -848,7 +849,7 @@ jobs:
       - name: Build Windows (Release)
         working-directory: repos/CrisperWeaver
         shell: pwsh
-        run: flutter build windows --release
+        run: flutter build windows --release --dart-define=CW_NONCOMMERCIAL_MODELS=true
 
       - name: Bundle CrispASR + glint DLLs next to runner.exe
         working-directory: repos/CrisperWeaver
