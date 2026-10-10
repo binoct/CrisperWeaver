@@ -45,7 +45,12 @@ dependencies:
   fixnum: ^1.1.0
 
   # File handling
-  file_picker: ">=11.0.2 <13.0.0"
+  # Lower bound pinned to 12.3.0 stable: the app uses the post-rework API
+  # (FilePicker.pickFiles() -> List<PlatformFile>, saveFile() -> String?).
+  # A loose ">=11" constraint let pub resolve 12.0.0-beta.5, a prerelease
+  # mid-rework whose return types were still FilePickerResult?, which broke
+  # every platform build at kernel compile (2026-10-10).
+  file_picker: ^12.3.0
   path: ^1.8.3
 
   # CLI (bin/crisperweaver.dart) command parsing — already transitive,

@@ -1,0 +1,890 @@
+name: Compile Check
+
+# Full build modelled on release.yml: the artefacts are attached to THIS
+# workflow run as downloadable GitHub Actions artifacts instead of being
+# uploaded to a GitHub Release — nothing is published, no Release is created
+# and nothing is pushed to App Store Connect / TestFlight. Signing is
+# test-grade: Android uses the release signing secrets when present and
+# otherwise falls back to the Gradle debug keystore; iOS ships only an
+# unsigned --no-codesign IPA for sideload re-signing. Triggered manually
+# from the Actions tab; builds whatever ref the dispatch ran on (branch,
+# tag, or SHA). Download artefacts from the run summary page ("Artifacts").
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: "Platform to build"
+        type: choice
+        required: true
+        # Same default release.yml uses: the cheap, fast path.
+        default: android
+        options:
+          - android
+          - ios
+          - macos
+          - linux
+          - windows
+          - all
+
+# Scoped per selected platform, so (e.g.) an iOS run does not cancel an
+# in-flight Android run — same isolation the release dispatch uses.
+concurrency:
+  group: compile-check-${{ inputs.platform }}
+  cancel-in-progress: true
+
+env:
+  FLUTTER_VERSION: "3.44.1"
+  # Keep these pins identical to release.yml so a green compile check means
+  # the release build's dependencies are the ones actually exercised.
+  CRISPASR_REPO: CrispStrobe/CrispASR
+  CRISPASR_REF: 2bf39c58a53160ed10aed82d5d621c794dc32bba
+  CRISPEMBED_REPO: CrispStrobe/CrispEmbed
+  CRISPEMBED_REF: 40e7b7dd00bb6b1505c9e6ac74bef0c97efef337
+  GLINT_REPO: CrispStrobe/glint
+  GLINT_REF: 77738f3ed9b15f627196cc5bbd7f6406814ba2fb
+  # Smoke-test artefacts don't need the 90-day default retention.
+  ARTIFACT_RETENTION_DAYS: "14"
+
+jobs:
+  build-macos:
+    name: macOS (.app.zip)
+    if: inputs.platform == 'all' || inputs.platform == 'macos'
+    runs-on: macos-latest
+    # Same OOM guard as release.yml: --parallel 2 below + headroom.
+    timeout-minutes: 120
+    steps:
+      - name: Check out CrisperWeaver
+        uses: actions/checkout@v5
+        with:
+          path: repos/CrisperWeaver
+
+      - name: Check out sibling CrispASR
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.CRISPASR_REPO }}
+          ref: ${{ env.CRISPASR_REF }}
+          path: repos/CrispASR
+          submodules: recursive
+
+      - name: Check out sibling CrispEmbed
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.CRISPEMBED_REPO }}
+          ref: ${{ env.CRISPEMBED_REF }}
+          path: repos/CrispEmbed
+          submodules: recursive
+
+      - name: Check out sibling glint
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.GLINT_REPO }}
+          ref: ${{ env.GLINT_REF }}
+          path: repos/glint
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Build libwhisper.dylib (Release + Metal)
+        working-directory: repos/CrispASR
+        run: |
+          ORT_ROOT="$(bash scripts/fetch_onnxruntime.sh "$RUNNER_TEMP/onnxruntime-sdk")"
+          cmake -B build -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3 \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DBUILD_SHARED_LIBS=ON -DWHISPER_METAL=ON \
+            -DCRISPASR_WITH_ESPEAK_NG=AUTO \
+            -DCRISPASR_OPUS_FETCH=ON \
+            -DCRISPASR_ONNXRUNTIME_ROOT="$ORT_ROOT"
+          cmake --build build --config Release --parallel 2 --target crispasr-lib
+          ls -lh build/src/libwhisper*.dylib
+
+      - name: Build libglint.dylib (codec suite)
+        working-directory: repos/glint
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
+            -DCMAKE_OSX_ARCHITECTURES=arm64
+          cmake --build build --config Release --parallel 2 --target glint_shared
+          ls -lh build/libglint.dylib
+
+      - name: Build libcrispembed.dylib (self-contained)
+        working-directory: repos/CrispEmbed
+        run: |
+          cmake -B build-crisperweaver -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DCRISPEMBED_BUILD_SHARED=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_METAL=ON \
+            -DGGML_METAL_EMBED_LIBRARY=ON \
+            -DCRISP_AUDIO_DIR="$PWD/build-crisperweaver/disabled/crisp_audio" \
+            -DCRISP_PUNC_DIR="$PWD/build-crisperweaver/disabled/crisp_punc" \
+            -DCRISP_LID_DIR="$PWD/build-crisperweaver/disabled/crisp_lid" \
+            -DCRISP_TRUECASE_DIR="$PWD/build-crisperweaver/disabled/crisp_truecase"
+          cmake --build build-crisperweaver --config Release --parallel 2 \
+            --target crispembed-shared
+          ls -lh build-crisperweaver/libcrispembed*.dylib
+
+      - name: Pub get
+        working-directory: repos/CrisperWeaver
+        run: flutter pub get
+
+      - name: Generate build info (git hash + timestamp)
+        working-directory: repos/CrisperWeaver
+        run: bash scripts/gen_build_info.sh
+
+      - name: Refresh baked models catalogue
+        working-directory: repos/CrisperWeaver
+        run: timeout 120 dart run scripts/bake_models_catalog.dart || true
+
+      - name: Build macOS (Release)
+        working-directory: repos/CrisperWeaver
+        run: flutter build macos --release
+
+      - name: Bundle all CrispASR + glint dylibs + ad-hoc sign
+        working-directory: repos/CrisperWeaver
+        run: |
+          CRISPASR_DIR="$GITHUB_WORKSPACE/repos/CrispASR" \
+            CRISPEMBED_DIR="$GITHUB_WORKSPACE/repos/CrispEmbed" \
+            CRISPEMBED_BUILD_DIR="$GITHUB_WORKSPACE/repos/CrispEmbed/build-crisperweaver" \
+            GLINT_DIR="$GITHUB_WORKSPACE/repos/glint" \
+            APP=build/macos/Build/Products/Release/crisper_weaver.app \
+            ./scripts/bundle_macos_dylibs.sh
+
+      - name: Verify macOS compatibility metadata
+        working-directory: repos/CrisperWeaver
+        run: ./scripts/verify_macos_release.sh build/macos/Build/Products/Release/crisper_weaver.app
+
+      - name: Zip .app
+        working-directory: repos/CrisperWeaver/build/macos/Build/Products/Release
+        run: |
+          ditto -c -k --keepParent crisper_weaver.app crisper_weaver-macos.zip
+          shasum -a 256 crisper_weaver-macos.zip | tee crisper_weaver-macos.zip.sha256
+
+      - name: Upload .app.zip as run artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: crisper_weaver-macos
+          path: |
+            repos/CrisperWeaver/build/macos/Build/Products/Release/crisper_weaver-macos.zip
+            repos/CrisperWeaver/build/macos/Build/Products/Release/crisper_weaver-macos.zip.sha256
+          retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
+
+  build-linux:
+    name: Linux (.tar.gz bundle)
+    if: inputs.platform == 'all' || inputs.platform == 'linux'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out CrisperWeaver
+        uses: actions/checkout@v5
+        with:
+          path: repos/CrisperWeaver
+
+      - name: Check out sibling CrispASR
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.CRISPASR_REPO }}
+          ref: ${{ env.CRISPASR_REF }}
+          path: repos/CrispASR
+          submodules: recursive
+
+      - name: Check out sibling CrispEmbed
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.CRISPEMBED_REPO }}
+          ref: ${{ env.CRISPEMBED_REF }}
+          path: repos/CrispEmbed
+          submodules: recursive
+
+      - name: Check out sibling glint
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.GLINT_REPO }}
+          ref: ${{ env.GLINT_REF }}
+          path: repos/glint
+
+      - name: Install Linux desktop toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang cmake ninja-build pkg-config \
+            libgtk-3-dev liblzma-dev libstdc++-12-dev \
+            libsecret-1-dev libjsoncpp-dev libglu1-mesa \
+            libkeybinder-3.0-dev libayatana-appindicator3-dev \
+            libespeak-ng-dev espeak-ng-data
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Build libcrispasr.so (Release, all-in-one)
+        working-directory: repos/CrispASR
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DCRISPASR_BUILD_EXAMPLES=OFF -DCRISPASR_BUILD_TESTS=OFF \
+            -DCRISPASR_OPUS_FETCH=ON \
+            -DCRISPASR_WITH_ESPEAK_NG=AUTO
+          cmake --build build --config Release --parallel 2 --target crispasr-lib
+          cd build
+          gcc -shared -o src/libcrispasr.so \
+            -Wl,-rpath,'$ORIGIN' \
+            -Wl,--whole-archive \
+            src/libcrispasr.a \
+            $(find . -name "lib*.a" ! -name "libcrispasr.a" ! -name "libCatch*" ! -name "libcommon*" -printf "%p ") \
+            -Wl,--no-whole-archive \
+            -lstdc++ -lm -lpthread -fopenmp
+          ln -sf libcrispasr.so src/libwhisper.so
+          ls -lh src/libcrispasr.so
+          nm -D src/libcrispasr.so | grep -c "T " | xargs printf "  %d exported symbols\n"
+          # Verify opus decode symbols (#26)
+          SYMS=$(nm -D src/libcrispasr.so)
+          for sym in opus_decode_float opus_decoder_create op_open_file crispasr_audio_load whisper_full; do
+            if ! echo "$SYMS" | grep -q "$sym"; then
+              echo "::error::libcrispasr.so missing symbol: $sym" >&2
+              exit 1
+            fi
+          done
+          echo "  ✓ opus + core symbols verified"
+
+      - name: Build libglint.so (codec suite)
+        working-directory: repos/glint
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release --parallel --target glint_shared
+          ls -lh build/libglint.so
+
+      - name: Enable Linux desktop + pub get
+        working-directory: repos/CrisperWeaver
+        run: |
+          flutter config --enable-linux-desktop
+          flutter pub get
+
+      - name: Generate build info (git hash + timestamp)
+        working-directory: repos/CrisperWeaver
+        run: bash scripts/gen_build_info.sh
+
+      - name: Refresh baked models catalogue
+        working-directory: repos/CrisperWeaver
+        run: timeout 120 dart run scripts/bake_models_catalog.dart || true
+
+      - name: Build Linux (Release)
+        working-directory: repos/CrisperWeaver
+        run: flutter build linux --release
+
+      - name: Bundle libcrispasr.so + libglint into bundle/lib/
+        working-directory: repos/CrisperWeaver
+        run: |
+          BUNDLE=build/linux/x64/release/bundle
+          mkdir -p "$BUNDLE/lib"
+          cp ../CrispASR/build/src/libcrispasr.so "$BUNDLE/lib/libwhisper.so"
+          ln -sf libwhisper.so "$BUNDLE/lib/libcrispasr.so"
+          cp ../glint/build/libglint.so "$BUNDLE/lib/libglint.so"
+          ls -lh "$BUNDLE/lib/libwhisper.so"
+          nm -D "$BUNDLE/lib/libwhisper.so" | grep -q ggml_siglu_swapped && echo "OK: ggml_siglu_swapped exported" || echo "WARN: ggml_siglu_swapped missing!"
+          nm -D "$BUNDLE/lib/libwhisper.so" | grep -q crispasr_session_available_backends && echo "OK: available_backends exported" || echo "WARN: available_backends missing!"
+
+      - name: Tarball
+        working-directory: repos/CrisperWeaver/build/linux/x64/release
+        run: |
+          mv bundle crisper_weaver
+          tar -czf crisper_weaver-linux-x64.tar.gz crisper_weaver
+          sha256sum crisper_weaver-linux-x64.tar.gz | tee crisper_weaver-linux-x64.tar.gz.sha256
+
+      - name: Upload tarball as run artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: crisper_weaver-linux
+          path: |
+            repos/CrisperWeaver/build/linux/x64/release/crisper_weaver-linux-x64.tar.gz
+            repos/CrisperWeaver/build/linux/x64/release/crisper_weaver-linux-x64.tar.gz.sha256
+          retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
+
+  build-android:
+    name: Android APK (arm64)
+    if: inputs.platform == 'all' || inputs.platform == 'android'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out CrisperWeaver
+        uses: actions/checkout@v5
+        with:
+          path: repos/CrisperWeaver
+
+      - name: Check out sibling CrispASR
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.CRISPASR_REPO }}
+          ref: ${{ env.CRISPASR_REF }}
+          path: repos/CrispASR
+          submodules: recursive
+
+      - name: Check out sibling CrispEmbed
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.CRISPEMBED_REPO }}
+          ref: ${{ env.CRISPEMBED_REF }}
+          path: repos/CrispEmbed
+          submodules: recursive
+
+      - name: Check out sibling glint
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.GLINT_REPO }}
+          ref: ${{ env.GLINT_REF }}
+          path: repos/glint
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK + NDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install NDK 26
+        run: |
+          sdkmanager --install "ndk;26.3.11579264" >/dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/26.3.11579264" >> $GITHUB_ENV
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Build espeak-ng for arm64-android (kokoro phonemizer)
+        env:
+          ESPEAK_NG_REF: "master"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf automake libtool pkg-config
+          git clone --depth=1 --branch "$ESPEAK_NG_REF" \
+            https://github.com/espeak-ng/espeak-ng.git espeak-ng-src
+          cd espeak-ng-src
+          # Step 1 — native build for the data-generation binary.
+          cmake -S . -B build-native \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DESPEAK_COMPAT=OFF \
+            -DUSE_ASYNC=OFF -DUSE_MBROLA=OFF -DUSE_KLATT=OFF \
+            -DUSE_LIBPCAUDIO=OFF -DUSE_LIBSONIC=OFF \
+            -DENABLE_TESTS=OFF \
+            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/espeak-ng-native"
+          cmake --build build-native --parallel --target espeak-ng-bin
+          cmake --build build-native --parallel --target data
+          cmake --install build-native
+          ESPEAK_NG_NATIVE_ROOT="$GITHUB_WORKSPACE/espeak-ng-native"
+          echo "ESPEAK_NG_NATIVE_ROOT=$ESPEAK_NG_NATIVE_ROOT" >> $GITHUB_ENV
+          # Step 2 — cross-compile static lib for arm64-android.
+          NDK_TC="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake"
+          cmake -S . -B build-android \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK_TC" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_NATIVE_API_LEVEL=24 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DUSE_ASYNC=OFF -DUSE_MBROLA=OFF -DUSE_KLATT=OFF \
+            -DUSE_LIBPCAUDIO=OFF -DUSE_LIBSONIC=OFF \
+            -DCOMPILE_INTONATIONS=OFF \
+            -DESPEAK_COMPAT=OFF \
+            -DENABLE_TESTS=OFF \
+            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/espeak-ng-android"
+          cmake --build build-android --parallel
+          cmake --install build-android
+          ESPEAK_NG_ANDROID_ROOT="$GITHUB_WORKSPACE/espeak-ng-android"
+          echo "ESPEAK_NG_ANDROID_ROOT=$ESPEAK_NG_ANDROID_ROOT" >> $GITHUB_ENV
+
+      - name: Cross-build libcrispasr.so for Android arm64 (all-in-one)
+        working-directory: repos/CrispASR
+        env:
+          NDK_TC: ${{ env.ANDROID_NDK_HOME }}/build/cmake/android.toolchain.cmake
+        run: |
+          ESPEAK_INC=$(find "$ESPEAK_NG_ANDROID_ROOT" -maxdepth 4 -type d -name 'espeak-ng' -path '*/include/*' | head -1)
+          ESPEAK_INC="${ESPEAK_INC%/espeak-ng}"
+          ESPEAK_LIB=$(find "$ESPEAK_NG_ANDROID_ROOT" -name 'libespeak-ng.a' | head -1)
+          UCD_LIB=$(find "$GITHUB_WORKSPACE/espeak-ng-src/build-android" \
+            -name 'libucd.a' 2>/dev/null | head -1)
+          if [ -z "$UCD_LIB" ]; then
+            UCD_LIB=$(find "$ESPEAK_NG_ANDROID_ROOT" -name 'libucd.a' 2>/dev/null | head -1)
+          fi
+          if [ -z "$ESPEAK_INC" ] || [ -z "$ESPEAK_LIB" ] || [ -z "$UCD_LIB" ]; then
+            echo "::error::espeak-ng cross-build artefacts incomplete — espeak-ng=$ESPEAK_LIB, ucd=$UCD_LIB" >&2
+            exit 1
+          fi
+          echo "UCD_LIB=$UCD_LIB" >> $GITHUB_ENV
+          cmake -S . -B build-android/arm64-v8a \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK_TC" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_NATIVE_API_LEVEL=24 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DCRISPASR_BUILD_EXAMPLES=OFF \
+            -DCRISPASR_BUILD_TESTS=OFF \
+            -DCRISPASR_OPUS_FETCH=ON \
+            -DCRISPASR_WITH_ESPEAK_NG=AUTO
+          cmake --build build-android/arm64-v8a --parallel
+          cd build-android/arm64-v8a
+          NDK_CC=$(find $ANDROID_NDK_HOME/toolchains/llvm/prebuilt -name "aarch64-linux-android24-clang++" | head -1)
+          $NDK_CC -shared -o src/libcrispasr.so \
+            -fopenmp -static-openmp \
+            -Wl,--whole-archive \
+            src/libcrispasr.a \
+            $(find . -name "lib*.a" ! -name "libcrispasr.a" ! -name "libCatch*" ! -name "libcommon*" -printf "%p ") \
+            -Wl,--no-whole-archive \
+            -lm -llog -lmediandk
+          ln -sf libcrispasr.so src/libwhisper.so
+          ls -lh src/libcrispasr.so
+          NDKRE=$(find $ANDROID_NDK_HOME/toolchains/llvm/prebuilt -name "llvm-readelf" | head -1)
+          if "$NDKRE" --dyn-symbols src/libcrispasr.so \
+              | awk '$5=="UND"' | grep -qE "__kmpc|^.* omp_"; then
+            echo "::error::libcrispasr.so still has UND OpenMP symbols" >&2
+            exit 1
+          fi
+          if "$NDKRE" --dyn-symbols src/libcrispasr.so \
+              | awk '$5=="UND"' | grep -qE "\\bucd_"; then
+            echo "::error::libcrispasr.so still has UND ucd_* symbols — libucd.a missing from link" >&2
+            exit 1
+          fi
+          SYMS=$("$NDKRE" --dyn-symbols src/libcrispasr.so)
+          for sym in opus_decode_float opus_decoder_create op_open_file ma_libopus_init_file; do
+            if ! echo "$SYMS" | grep -q "$sym"; then
+              echo "::error::libcrispasr.so missing opus symbol: $sym" >&2
+              exit 1
+            fi
+          done
+          for sym in crispasr_audio_load whisper_full whisper_init_from_file_with_params; do
+            if ! echo "$SYMS" | grep -q "$sym"; then
+              echo "::error::libcrispasr.so missing core symbol: $sym" >&2
+              exit 1
+            fi
+          done
+          echo "✓ all native symbol checks passed"
+
+      - name: Cross-build libglint.so for Android arm64 (codec suite)
+        working-directory: repos/glint
+        env:
+          NDK_TC: ${{ env.ANDROID_NDK_HOME }}/build/cmake/android.toolchain.cmake
+        run: |
+          cmake -S . -B build-android/arm64-v8a \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK_TC" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-24 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGLINT_MODE=fixed
+          cmake --build build-android/arm64-v8a --parallel --target glint_shared
+          ls -lh build-android/arm64-v8a/libglint.so
+
+      - name: Copy native lib into jniLibs/
+        working-directory: repos/CrisperWeaver
+        run: |
+          DEST=android/app/src/main/jniLibs/arm64-v8a
+          mkdir -p "$DEST"
+          cp ../CrispASR/build-android/arm64-v8a/src/libcrispasr.so "$DEST/libwhisper.so"
+          cp "$DEST/libwhisper.so" "$DEST/libcrispasr.so"
+          cp ../glint/build-android/arm64-v8a/libglint.so "$DEST/libglint.so"
+          CPPSHARED=$(find "$ANDROID_NDK_HOME" -path "*aarch64-linux-android*" \
+            -name "libc++_shared.so" 2>/dev/null | head -1)
+          if [ -z "$CPPSHARED" ]; then
+            echo "::error::libc++_shared.so not found under \$ANDROID_NDK_HOME" >&2
+            exit 1
+          fi
+          cp "$CPPSHARED" "$DEST/"
+          ls -lh "$DEST/"
+          NEEDED=$(${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf \
+            -d "$DEST/libcrispasr.so" | awk -F'[][]' '/\(NEEDED\)/{print $2}')
+          echo "libcrispasr.so NEEDS: $NEEDED"
+          for n in $NEEDED; do
+            case "$n" in
+              libm.so|libc.so|libdl.so|liblog.so|libmediandk.so) ;;  # provided by Android
+              *) [ -f "$DEST/$n" ] || { echo "::error::missing NEEDED dep $n" >&2; exit 1; } ;;
+            esac
+          done
+
+      - name: Pub get
+        working-directory: repos/CrisperWeaver
+        run: flutter pub get
+
+      - name: Generate build info (git hash + timestamp)
+        working-directory: repos/CrisperWeaver
+        run: bash scripts/gen_build_info.sh
+
+      - name: Refresh baked models catalogue
+        working-directory: repos/CrisperWeaver
+        run: timeout 120 dart run scripts/bake_models_catalog.dart || true
+
+      # Test build, not a release: when all four ANDROID_* signing secrets
+      # are present the APK gets the persistent release key (can install as
+      # an update over a released build). When they are absent we do NOT
+      # fail — no key.properties is written, and build.gradle.kts falls back
+      # to the Gradle debug keystore so the build still produces an
+      # installable APK (#36 trade-off accepted for a smoke test).
+      - name: Configure signing (release secrets, else debug fallback)
+        id: signing
+        working-directory: repos/CrisperWeaver
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+        run: |
+          if [ -z "$ANDROID_KEYSTORE_BASE64" ] || [ -z "$ANDROID_KEY_ALIAS" ] \
+             || [ -z "$ANDROID_KEY_PASSWORD" ] || [ -z "$ANDROID_STORE_PASSWORD" ]; then
+            echo "::warning::Android signing secrets absent - APK will be signed with the Gradle DEBUG keystore (test build only)."
+            echo "signing_enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 --decode > android/app/release.jks
+          printf 'storePassword=%s\nkeyPassword=%s\nkeyAlias=%s\nstoreFile=release.jks\n' \
+            "$ANDROID_STORE_PASSWORD" "$ANDROID_KEY_PASSWORD" "$ANDROID_KEY_ALIAS" \
+            > android/key.properties
+          echo "signing_enabled=true" >> "$GITHUB_OUTPUT"
+
+      - name: Build APK (release)
+        working-directory: repos/CrisperWeaver
+        run: flutter build apk --release --target-platform=android-arm64
+
+      - name: Rename APK
+        working-directory: repos/CrisperWeaver
+        run: |
+          cp build/app/outputs/flutter-apk/app-release.apk \
+             crisper_weaver-android-arm64.apk
+          sha256sum crisper_weaver-android-arm64.apk | tee crisper_weaver-android-arm64.apk.sha256
+
+      # Release-signed APKs must still carry the persistent release key;
+      # debug-fallback APKs only need to verify as signed — the cert is the
+      # runner's throwaway debug key, expected for a smoke test.
+      - name: Verify APK signature
+        working-directory: repos/CrisperWeaver
+        env:
+          SIGNING_ENABLED: ${{ steps.signing.outputs.signing_enabled }}
+          EXPECTED_CERT_SHA256: f810e2ca1033655e406a82e3baec2923cf8bdc73d2c5c38bcb8344a46f44a5d9
+        run: |
+          APKSIGNER=$(ls "$ANDROID_HOME"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -1)
+          if [ -z "$APKSIGNER" ]; then
+            sdkmanager --install "build-tools;35.0.0" >/dev/null
+            APKSIGNER="$ANDROID_HOME/build-tools/35.0.0/apksigner"
+          fi
+          "$APKSIGNER" verify --print-certs crisper_weaver-android-arm64.apk | tee signing.txt
+          GOT=$(sed -n 's/.*certificate SHA-256 digest: //p' signing.txt | head -1)
+          echo "$GOT" > crisper_weaver-android-signing-cert.sha256.txt
+          if [ "$SIGNING_ENABLED" = "true" ]; then
+            if [ "$GOT" != "$EXPECTED_CERT_SHA256" ]; then
+              echo "::error::APK signed with $GOT, expected release key $EXPECTED_CERT_SHA256 (#36)"
+              exit 1
+            fi
+            echo "✓ signed with the persistent release key"
+          else
+            echo "✓ debug-signed test APK (cert $GOT)"
+          fi
+          rm -f android/app/release.jks android/key.properties
+
+      - name: Upload APK as run artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: crisper_weaver-android-arm64
+          path: |
+            repos/CrisperWeaver/crisper_weaver-android-arm64.apk
+            repos/CrisperWeaver/crisper_weaver-android-arm64.apk.sha256
+            repos/CrisperWeaver/crisper_weaver-android-signing-cert.sha256.txt
+          retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
+
+  build-ios:
+    name: iOS IPA (unsigned, sideload-ready)
+    if: inputs.platform == 'all' || inputs.platform == 'ios'
+    # Same SDK requirement as release.yml (Xcode 26 / iOS 26.1 SDK).
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - name: Check out CrisperWeaver
+        uses: actions/checkout@v5
+        with:
+          path: repos/CrisperWeaver
+
+      - name: Check out sibling CrispASR
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.CRISPASR_REPO }}
+          ref: ${{ env.CRISPASR_REF }}
+          path: repos/CrispASR
+          submodules: recursive
+
+      - name: Check out sibling CrispEmbed
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.CRISPEMBED_REPO }}
+          ref: ${{ env.CRISPEMBED_REF }}
+          path: repos/CrispEmbed
+          submodules: recursive
+
+      - name: Check out sibling glint
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.GLINT_REPO }}
+          ref: ${{ env.GLINT_REF }}
+          path: repos/glint
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Build crispasr.xcframework (iOS slim)
+        working-directory: repos/CrisperWeaver
+        env:
+          CRISPASR_DIR: ${{ github.workspace }}/repos/CrispASR
+          IOS_MIN_OS_VERSION: "13.0"
+        run: bash scripts/build_ios_xcframework.sh
+
+      - name: Wire xcframework into Runner.xcodeproj
+        working-directory: repos/CrisperWeaver
+        run: |
+          gem install xcodeproj --no-document
+          ruby scripts/wire_ios_xcframework.rb
+
+      - name: Build glint.xcframework (iOS codec suite)
+        working-directory: repos/CrisperWeaver
+        env:
+          GLINT_DIR: ${{ github.workspace }}/repos/glint
+          IOS_MIN_OS_VERSION: "13.0"
+        run: bash scripts/build_ios_glint_xcframework.sh
+
+      - name: Wire glint.xcframework into Runner.xcodeproj
+        working-directory: repos/CrisperWeaver
+        run: ruby scripts/wire_ios_glint.rb
+
+      - name: Pub get
+        working-directory: repos/CrisperWeaver
+        run: flutter pub get
+
+      - name: Generate build info (git hash + timestamp)
+        working-directory: repos/CrisperWeaver
+        run: bash scripts/gen_build_info.sh
+
+      - name: Refresh baked models catalogue
+        working-directory: repos/CrisperWeaver
+        run: timeout 120 dart run scripts/bake_models_catalog.dart || true
+
+      - name: Build iOS (no codesign — Flutter step)
+        working-directory: repos/CrisperWeaver
+        run: flutter build ios --release --no-codesign
+
+      # The only iOS artefact: unsigned sideload IPA (AltStore / SideStore /
+      # Feather re-sign). This is a compile test — no Distribution signing
+      # and no App Store Connect involvement; just package the --no-codesign
+      # Flutter build.
+      - name: Package unsigned IPA
+        working-directory: repos/CrisperWeaver
+        run: |
+          mkdir -p Payload
+          cp -R build/ios/iphoneos/Runner.app Payload/
+          zip -qr crisper_weaver-ios-unsigned.ipa Payload
+          shasum -a 256 crisper_weaver-ios-unsigned.ipa | tee crisper_weaver-ios-unsigned.ipa.sha256
+
+      - name: Upload unsigned IPA as run artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: crisper_weaver-ios
+          path: |
+            repos/CrisperWeaver/crisper_weaver-ios-unsigned.ipa
+            repos/CrisperWeaver/crisper_weaver-ios-unsigned.ipa.sha256
+          retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
+
+  build-windows:
+    name: Windows (.zip + .msix)
+    if: inputs.platform == 'all' || inputs.platform == 'windows'
+    runs-on: windows-latest
+    steps:
+      - name: Check out CrisperWeaver
+        uses: actions/checkout@v5
+        with:
+          path: repos/CrisperWeaver
+
+      - name: Check out sibling CrispASR
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.CRISPASR_REPO }}
+          ref: ${{ env.CRISPASR_REF }}
+          path: repos/CrispASR
+          submodules: recursive
+
+      - name: Check out sibling CrispEmbed
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.CRISPEMBED_REPO }}
+          ref: ${{ env.CRISPEMBED_REF }}
+          path: repos/CrispEmbed
+          submodules: recursive
+
+      - name: Check out sibling glint
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.GLINT_REPO }}
+          ref: ${{ env.GLINT_REF }}
+          path: repos/glint
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Build espeak-ng from source (kokoro phonemizer)
+        shell: pwsh
+        env:
+          ESPEAK_NG_REF: "master"
+        run: |
+          git clone --depth=1 --branch $env:ESPEAK_NG_REF `
+            https://github.com/espeak-ng/espeak-ng.git espeak-ng-src
+          cd espeak-ng-src
+          cmake -B build `
+            -A x64 `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DBUILD_SHARED_LIBS=ON `
+            -DUSE_ASYNC=OFF -DUSE_MBROLA=OFF -DUSE_KLATT=OFF `
+            -DUSE_LIBPCAUDIO=OFF -DUSE_LIBSONIC=OFF `
+            -DESPEAK_COMPAT=OFF `
+            -DENABLE_TESTS=OFF `
+            -DCMAKE_INSTALL_PREFIX="$env:GITHUB_WORKSPACE\espeak-ng-win"
+          cmake --build build --config Release --target espeak-ng-bin
+          cmake --build build --config Release
+          cmake --install build --config Release
+          $root = "$env:GITHUB_WORKSPACE\espeak-ng-win"
+          if (-not (Test-Path $root)) {
+            Write-Error "espeak-ng install dir missing after build"
+            exit 1
+          }
+          echo "ESPEAK_NG_ROOT=$root" >> $env:GITHUB_ENV
+
+      - name: Build whisper.dll (shared, Release)
+        working-directory: repos/CrispASR
+        shell: pwsh
+        run: |
+          $espeakRoot = $env:ESPEAK_NG_ROOT
+          $espeakInc  = Join-Path $espeakRoot "include"
+          $espeakLib  = ""
+          foreach ($cand in @(
+              "$espeakRoot\lib\libespeak-ng.lib",
+              "$espeakRoot\lib\espeak-ng.lib",
+              "$espeakRoot\libespeak-ng.lib")) {
+            if (Test-Path $cand) { $espeakLib = $cand; break }
+          }
+          if (-not $espeakLib) {
+            Get-ChildItem -Recurse -Path $espeakRoot -Filter "*espeak-ng*.lib" |
+              ForEach-Object { if (-not $espeakLib) { $espeakLib = $_.FullName } }
+          }
+          if (-not ($espeakLib -and (Test-Path "$espeakInc\espeak-ng\speak_lib.h"))) {
+            Write-Error "espeak-ng dev files missing (.lib=$espeakLib, header=$espeakInc\espeak-ng\speak_lib.h)"
+            exit 1
+          }
+          # Patch POSIX popen/pclose → MSVC _popen/_pclose (needed for
+          # zonos_tts.cpp; keeps the Windows build green pending upstream).
+          Get-ChildItem src -Recurse -Filter *.cpp |
+            Where-Object { (Get-Content $_.FullName -Raw) -match '\bpopen\b' } |
+            ForEach-Object {
+              $content = Get-Content $_.FullName -Raw
+              if ($content -notmatch '#define popen _popen') {
+                $patch = "#ifdef _MSC_VER`n#define popen _popen`n#define pclose _pclose`n#endif`n"
+                Set-Content $_.FullName ($patch + $content)
+                Write-Host "  patched $($_.Name) with popen→_popen compat"
+              }
+            }
+          cmake -B build `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DBUILD_SHARED_LIBS=ON `
+            -DGGML_NATIVE=OFF `
+            -DGGML_AVX2=ON `
+            -DGGML_AVX=ON `
+            -DGGML_FMA=ON `
+            -DGGML_F16C=ON `
+            -DGGML_AVX512=OFF `
+            -DWHISPER_BUILD_EXAMPLES=OFF `
+            -DWHISPER_BUILD_TESTS=OFF `
+            -DCRISPASR_OPUS_FETCH=ON `
+            -DCRISPASR_WITH_ESPEAK_NG=AUTO
+          cmake --build build --config Release --parallel --target crispasr-lib
+          Get-ChildItem build -Recurse -Filter *.dll | Select-Object FullName, Length
+
+      - name: Build glint.dll (codec suite)
+        working-directory: repos/glint
+        shell: pwsh
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release --parallel --target glint_shared
+          Get-ChildItem build -Recurse -Filter glint.dll | Select-Object FullName, Length
+
+      - name: Enable Windows desktop + pub get
+        working-directory: repos/CrisperWeaver
+        shell: pwsh
+        run: |
+          flutter config --enable-windows-desktop
+          flutter pub get
+
+      - name: Generate build info (git hash + timestamp)
+        working-directory: repos/CrisperWeaver
+        shell: bash
+        run: bash scripts/gen_build_info.sh
+
+      - name: Refresh baked models catalogue
+        working-directory: repos/CrisperWeaver
+        shell: pwsh
+        run: timeout 120 dart run scripts/bake_models_catalog.dart || true
+
+      - name: Build Windows (Release)
+        working-directory: repos/CrisperWeaver
+        shell: pwsh
+        run: flutter build windows --release
+
+      - name: Bundle CrispASR + glint DLLs next to runner.exe
+        working-directory: repos/CrisperWeaver
+        shell: pwsh
+        env:
+          CRISPASR_DIR: ${{ github.workspace }}\repos\CrispASR
+          GLINT_DIR: ${{ github.workspace }}\repos\glint
+          RUNNER_DIR: build\windows\x64\runner\Release
+        run: pwsh ./scripts/bundle_windows_dlls.ps1
+
+      - name: Build MSIX
+        working-directory: repos/CrisperWeaver
+        shell: pwsh
+        run: |
+          flutter pub run msix:create
+          $msix = Get-ChildItem -Recurse build\windows\x64\runner\Release -Filter *.msix | Select-Object -First 1
+          if (-not $msix) { Write-Error 'msix:create produced no .msix'; exit 1 }
+          $dst = "crisper_weaver-windows-x64.msix"
+          Copy-Item $msix.FullName $dst
+          (Get-FileHash $dst -Algorithm SHA256).Hash | Tee-Object -FilePath "${dst}.sha256"
+
+      - name: Zip release dir
+        working-directory: repos/CrisperWeaver/build/windows/x64/runner
+        shell: pwsh
+        run: |
+          Rename-Item Release crisper_weaver
+          Compress-Archive -Path crisper_weaver -DestinationPath crisper_weaver-windows-x64.zip -CompressionLevel Optimal
+          (Get-FileHash crisper_weaver-windows-x64.zip -Algorithm SHA256).Hash | Tee-Object -FilePath crisper_weaver-windows-x64.zip.sha256
+
+      - name: Upload zip + MSIX as run artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: crisper_weaver-windows
+          path: |
+            repos/CrisperWeaver/build/windows/x64/runner/crisper_weaver-windows-x64.zip
+            repos/CrisperWeaver/build/windows/x64/runner/crisper_weaver-windows-x64.zip.sha256
+            repos/CrisperWeaver/crisper_weaver-windows-x64.msix
+            repos/CrisperWeaver/crisper_weaver-windows-x64.msix.sha256
+          retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
